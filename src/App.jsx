@@ -359,17 +359,70 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
   const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#f43f5e'];
 
   return (
-    <div className={`min-h-screen ${darkMode ? 'bg-slate-950 text-white' : 'bg-gradient-to-br from-gray-50 via-blue-50 to-gray-50 text-gray-900'} p-6 relative overflow-hidden`}>
-      {/* Animated Background - Dark Mode Only */}
+    <div className={`min-h-screen ${darkMode ? 'bg-slate-950 text-white' : 'bg-gray-50 text-gray-900'} p-6 relative overflow-hidden`}>
+      {/* Animated Background - Dark Mode */}
       {darkMode && (
         <>
-          <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-blue-900/20 via-slate-950 to-slate-950"></div>
-          <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_bottom_left,_var(--tw-gradient-stops))] from-purple-900/20 via-transparent to-transparent"></div>
-          <div className="absolute top-0 -left-4 w-72 h-72 bg-purple-500 rounded-full mix-blend-multiply filter blur-3xl opacity-10 animate-pulse"></div>
-          <div className="absolute top-0 -right-4 w-72 h-72 bg-blue-500 rounded-full mix-blend-multiply filter blur-3xl opacity-10 animate-pulse" style={{animationDelay: '2s'}}></div>
-          <div className="absolute -bottom-8 left-20 w-72 h-72 bg-cyan-500 rounded-full mix-blend-multiply filter blur-3xl opacity-10 animate-pulse" style={{animationDelay: '4s'}}></div>
+          <div className="absolute inset-0 bg-gradient-to-br from-blue-950 via-slate-900 to-purple-950"></div>
+          
+          {/* Flowing Waves */}
+          <div className="absolute inset-0 opacity-30">
+            <div className="absolute top-0 left-0 right-0 h-full">
+              <div className="absolute top-1/4 left-0 right-0 h-32 bg-gradient-to-r from-blue-500/0 via-blue-500/40 to-blue-500/0 blur-2xl animate-wave"></div>
+              <div className="absolute top-1/2 left-0 right-0 h-40 bg-gradient-to-r from-purple-500/0 via-purple-500/30 to-purple-500/0 blur-2xl animate-wave-slow"></div>
+              <div className="absolute top-3/4 left-0 right-0 h-36 bg-gradient-to-r from-cyan-500/0 via-cyan-500/35 to-cyan-500/0 blur-2xl animate-wave-slower"></div>
+            </div>
+          </div>
+          
+          {/* Subtle orbs for depth */}
+          <div className="absolute top-10 right-10 w-96 h-96 bg-blue-500/20 rounded-full blur-3xl animate-pulse"></div>
+          <div className="absolute bottom-20 left-10 w-80 h-80 bg-purple-500/15 rounded-full blur-3xl animate-pulse" style={{animationDelay: '2s', animationDuration: '4s'}}></div>
         </>
       )}
+      
+      {/* Animated Background - Light Mode */}
+      {!darkMode && (
+        <>
+          <div className="absolute inset-0 bg-gradient-to-br from-blue-50 via-teal-50 to-cyan-50"></div>
+          
+          {/* Flowing Waves */}
+          <div className="absolute inset-0 opacity-40">
+            <div className="absolute top-0 left-0 right-0 h-full">
+              <div className="absolute top-1/4 left-0 right-0 h-32 bg-gradient-to-r from-teal-400/0 via-teal-400/30 to-teal-400/0 blur-2xl animate-wave"></div>
+              <div className="absolute top-1/2 left-0 right-0 h-40 bg-gradient-to-r from-blue-400/0 via-blue-400/25 to-blue-400/0 blur-2xl animate-wave-slow"></div>
+              <div className="absolute top-3/4 left-0 right-0 h-36 bg-gradient-to-r from-cyan-400/0 via-cyan-400/28 to-cyan-400/0 blur-2xl animate-wave-slower"></div>
+            </div>
+          </div>
+          
+          {/* Subtle orbs for depth */}
+          <div className="absolute top-20 right-20 w-80 h-80 bg-teal-300/20 rounded-full blur-3xl animate-pulse"></div>
+          <div className="absolute bottom-10 left-20 w-72 h-72 bg-blue-300/15 rounded-full blur-3xl animate-pulse" style={{animationDelay: '2s', animationDuration: '4s'}}></div>
+        </>
+      )}
+      
+      <style jsx>{`
+        @keyframes wave {
+          0%, 100% { transform: translateX(-50%) translateY(0); }
+          50% { transform: translateX(50%) translateY(-20px); }
+        }
+        @keyframes wave-slow {
+          0%, 100% { transform: translateX(50%) translateY(0); }
+          50% { transform: translateX(-30%) translateY(15px); }
+        }
+        @keyframes wave-slower {
+          0%, 100% { transform: translateX(-30%) translateY(0); }
+          50% { transform: translateX(40%) translateY(-10px); }
+        }
+        .animate-wave {
+          animation: wave 8s ease-in-out infinite;
+        }
+        .animate-wave-slow {
+          animation: wave-slow 12s ease-in-out infinite;
+        }
+        .animate-wave-slower {
+          animation: wave-slower 15s ease-in-out infinite;
+        }
+      `}</style>
       
       <div className="max-w-7xl mx-auto relative z-10">
         <div className="text-center mb-8">
