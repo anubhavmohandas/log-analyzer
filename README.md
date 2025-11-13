@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛡️ CyberNyx Log Analyzer
+# 🛡️ Nyxine Log Analyzer
 
 ### Advanced threat intelligence and log analysis platform
 
