@@ -1254,6 +1254,10 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     return colors[config.color] || 'bg-gray-500';
   };
 
+  // Score → Tailwind color helpers (component-scoped so all panels can use them)
+  const scoreColor = (s) => s >= 90 ? 'text-red-400' : s >= 80 ? 'text-orange-400' : s >= 65 ? 'text-yellow-400' : s >= 50 ? 'text-blue-400' : 'text-gray-400';
+  const scoreBg    = (s) => s >= 90 ? 'bg-red-500' : s >= 80 ? 'bg-orange-500' : s >= 65 ? 'bg-yellow-500' : s >= 50 ? 'bg-blue-500' : 'bg-gray-500';
+
   const toggleBookmark = (lineNumber) => {
     const newBookmarks = new Set(bookmarkedEvents);
     newBookmarks.has(lineNumber) ? newBookmarks.delete(lineNumber) : newBookmarks.add(lineNumber);
@@ -1629,9 +1633,6 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               const visibleSessions = showAllSessions ? inv : inv.slice(0, SESSION_PREVIEW);
               const hiddenCount = inv.length - SESSION_PREVIEW;
 
-              // Score → color helper
-              const scoreColor = (s) => s >= 90 ? 'text-red-400' : s >= 80 ? 'text-orange-400' : s >= 65 ? 'text-yellow-400' : s >= 50 ? 'text-blue-400' : 'text-gray-400';
-              const scoreBg = (s) => s >= 90 ? 'bg-red-500' : s >= 80 ? 'bg-orange-500' : s >= 65 ? 'bg-yellow-500 text-black' : s >= 50 ? 'bg-blue-500' : 'bg-gray-500';
               const sevDot = { critical: 'bg-red-500', high: 'bg-orange-400', medium: 'bg-yellow-400', low: 'bg-green-400' };
 
               const SessionCard = ({ session, idx }) => {
