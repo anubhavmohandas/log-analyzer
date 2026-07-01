@@ -146,7 +146,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     const actionMatch = logLine.match(actionPattern);
     if (actionMatch) params.action = actionMatch[1];
     
-    const userPattern = /(?:userId|user|username|account)[=:\s"']+([^"'\s]+)/i;
+    const userPattern = /(?:userId|user|username|account)[=:\s"']+([^"'\s\]]+)/i;
     const userMatch = logLine.match(userPattern);
     if (userMatch) params.user = userMatch[1];
     
@@ -502,7 +502,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
   const analyzeFromPaste = () => {
     if (!logText.trim()) return;
     setLoading(true);
-    setTimeout(() => { analyzeLogFile(logText.trim(), 'pasted_log.txt'); setLoading(false); }, 300);
+    setTimeout(() => {
+      try { analyzeLogFile(logText.trim(), 'pasted_log.txt'); }
+      catch (e) { console.error('Paste analysis error:', e); alert(`Analysis error: ${e?.message || 'Unknown error'}`); }
+      finally { setLoading(false); }
+    }, 300);
   };
 
   const generateReport = () => {
@@ -625,7 +629,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       const text = await file.text();
       analyzeLogFile(text, file.name);
     } catch (error) {
-      alert('Error reading file');
+      console.error('File analysis error:', error);
+      alert(`Analysis error: ${error?.message || 'Unknown error. Check console for details.'}`);
     } finally {
       setLoading(false);
     }
@@ -633,7 +638,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
 
   const loadSampleFile = (type) => {
     setLoading(true);
-    setTimeout(() => { analyzeLogFile(sampleLogs[type], `${type}_sample.log`); setLoading(false); }, 500);
+    setTimeout(() => {
+      try { analyzeLogFile(sampleLogs[type], `${type}_sample.log`); }
+      catch (e) { console.error('Sample load error:', e); alert(`Analysis error: ${e?.message || 'Unknown error'}`); }
+      finally { setLoading(false); }
+    }, 500);
   };
 
   const analyzeLogFile = (logContent, fileName) => {
@@ -663,7 +672,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     Array.from(uniqueIPs).forEach(ip => { ipIntel[ip] = generateIPIntelligence(ip); });
 
     const threats = detectAdvancedThreats(results);
-    const investigation = runInvestigationEngine(results);
+    let investigation = [];
+    try { investigation = runInvestigationEngine(results); } catch (e) { console.error('Investigation engine error:', e); }
     const stats = {
       total: results.length,
       alerts: results.filter(r => r.isAlert).length,
