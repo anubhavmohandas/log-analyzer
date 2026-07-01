@@ -430,7 +430,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       if (session.events.length < 3) return;
       const sessionFindings = [];
 
-      // Rule 1: Automated polling — find repeated event types with suspiciously regular intervals
+      // ── Rule 1: Automated polling ─────────────────────────────────────────
       const typeGroups = {};
       session.events.forEach(event => {
         const t = event.eventType;
@@ -445,9 +445,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         const stats = computeIntervalStats(tsList);
         if (!stats) return;
         const cv = stats.stdDev / stats.mean;
-        let score = cv < 0.03 ? 95 : cv < 0.10 ? 80 : cv < 0.20 ? 65 : cv < 0.35 ? 45 : 0;
+        // Confidence: CV drives base score, count adds up to +8 bonus
+        let score = cv < 0.03 ? 95 : cv < 0.08 ? 86 : cv < 0.15 ? 74 : cv < 0.25 ? 58 : cv < 0.40 ? 42 : 0;
         if (score === 0) return;
-        if (evts.length >= 10) score = Math.min(score + 4, 99);
+        const countBonus = Math.min(Math.floor((evts.length - 4) / 3) * 2, 8);
+        score = Math.min(score + countBonus, 99);
         if (!bestAutomation || score > bestAutomation.score) {
           const sortedTs = tsList
             .map(ts => ({ ts, secs: parseTimestampToSeconds(ts) }))
@@ -459,30 +461,40 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       });
 
       if (bestAutomation) {
+        const intervalStr = bestAutomation.stats.mean.toFixed(1);
+        const sigmaStr = bestAutomation.stats.stdDev.toFixed(2);
         sessionFindings.push({
           type: 'Automated API Polling',
           confidence: bestAutomation.score,
           icon: '🤖',
-          detail: `"${bestAutomation.type}" called ${bestAutomation.count} times — mean interval ${bestAutomation.stats.mean.toFixed(1)}s (σ = ${bestAutomation.stats.stdDev.toFixed(2)}s)`,
+          detail: `"${bestAutomation.type}" called ${bestAutomation.count} times — mean interval ${intervalStr}s (σ = ${sigmaStr}s)`,
+          evidence: [`${bestAutomation.count} calls to "${bestAutomation.type}"`, `Average interval: ${intervalStr}s`, `Std deviation: ${sigmaStr}s — near-zero indicates scripted timing`, `CV = ${(bestAutomation.stats.stdDev / bestAutomation.stats.mean).toFixed(3)}`],
+          caseSummaryData: { type: 'automation', eventType: bestAutomation.type, count: bestAutomation.count, interval: intervalStr, sigma: sigmaStr },
           mitre: { id: 'T1071', name: 'Application Layer Protocol', tactic: 'Command and Control' },
           mitigations: ['Rate-limit or block this account/IP', 'Require re-authentication', 'Audit accessed data', 'Check for credential compromise'],
           sparklineData: bestAutomation.sparklineData
         });
       }
 
-      // Rule 2: Reconnaissance — single session hitting many distinct endpoint types
+      // ── Rule 2: Reconnaissance ────────────────────────────────────────────
       if (session.eventTypes.size >= 5 && session.events.length >= 8) {
+        // Score scales with endpoint variety and total request count
+        const typeScore = Math.min(session.eventTypes.size * 7, 56); // max 56 from types
+        const volScore = Math.min(Math.floor(session.events.length / 4) * 3, 24); // max 24 from volume
+        const recon_confidence = Math.min(20 + typeScore + volScore, 82);
         sessionFindings.push({
           type: 'Potential Reconnaissance',
-          confidence: Math.min(45 + session.eventTypes.size * 4, 80),
+          confidence: recon_confidence,
           icon: '🔍',
           detail: `Accessed ${session.eventTypes.size} distinct endpoint types across ${session.events.length} requests`,
+          evidence: [`${session.eventTypes.size} distinct API/endpoint types accessed`, `${session.events.length} total requests in this session`, `Endpoint types: ${[...session.eventTypes].slice(0, 5).join(', ')}${session.eventTypes.size > 5 ? '…' : ''}`],
+          caseSummaryData: { type: 'recon', types: session.eventTypes.size, events: session.events.length },
           mitre: { id: 'T1595', name: 'Active Scanning', tactic: 'Reconnaissance' },
           mitigations: ['Review authorization per endpoint', 'Enable per-endpoint rate limiting', 'Flag account for manual review']
         });
       }
 
-      // Rule 3: After-hours access (before 06:00 or after 22:00)
+      // ── Rule 3: After-hours access ────────────────────────────────────────
       const afterHours = session.events.filter(e => {
         const s = parseTimestampToSeconds(e.parameters.timestamp || '');
         if (s === null) return false;
@@ -490,30 +502,41 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         return h < 6 || h >= 22;
       });
       if (afterHours.length >= 2) {
+        // Base 30, +6 per after-hours event (capped at 75), +10 if it's a large fraction of the session
+        const afterFraction = afterHours.length / session.events.length;
+        const ah_confidence = Math.min(30 + afterHours.length * 6 + (afterFraction > 0.5 ? 10 : 0), 75);
+        const ahTimes = afterHours.map(e => e.parameters.timestamp).filter(Boolean);
         sessionFindings.push({
           type: 'After-Hours Access',
-          confidence: 65,
+          confidence: ah_confidence,
           icon: '🌙',
           detail: `${afterHours.length} events outside business hours (before 06:00 or after 22:00)`,
+          evidence: [`${afterHours.length} after-hours events`, ahTimes.length ? `Timestamps: ${ahTimes.slice(0, 3).join(', ')}${ahTimes.length > 3 ? '…' : ''}` : null, `${(afterFraction * 100).toFixed(0)}% of session activity was after-hours`].filter(Boolean),
+          caseSummaryData: { type: 'afterhours', count: afterHours.length, times: ahTimes.slice(0, 3) },
           mitre: { id: 'T1078', name: 'Valid Accounts', tactic: 'Defense Evasion / Persistence' },
           mitigations: ['Verify after-hours access rights', 'Alert security team', 'Review for data exfiltration']
         });
       }
 
-      // Rule 4: Brute force / account takeover — many failed logins, possibly followed by success
+      // ── Rule 4: Brute force / credential stuffing ─────────────────────────
       const failedLogins = session.events.filter(e =>
-        /fail|denied|401|403/i.test(e.originalLog) && /login|auth/i.test(e.originalLog)
+        /\b(fail|denied|invalid|bad.*password)\b/i.test(e.originalLog) && /\b(login|auth|password)\b/i.test(e.originalLog)
       );
       if (failedLogins.length >= 3) {
         const hasSuccess = session.events.some((e, i) =>
-          /success|logged in/i.test(e.originalLog) && /login|auth/i.test(e.originalLog) &&
-          session.events.slice(0, i).some(p => /fail|denied|401|403/i.test(p.originalLog))
+          /\b(success|logged in|authenticated)\b/i.test(e.originalLog) && /\b(login|auth)\b/i.test(e.originalLog) &&
+          session.events.slice(0, i).some(p => /\b(fail|denied|invalid)\b/i.test(p.originalLog))
         );
+        // Scale: 3 fails = 62, each additional +5, cap at 88. Takeover adds 8 on top.
+        const bf_base = Math.min(62 + (failedLogins.length - 3) * 5, 88);
+        const bf_confidence = hasSuccess ? Math.min(bf_base + 8, 96) : bf_base;
         sessionFindings.push({
           type: hasSuccess ? 'Credential Stuffing / Account Takeover' : 'Brute Force Attempt',
-          confidence: hasSuccess ? 90 : 75,
+          confidence: bf_confidence,
           icon: '🔑',
           detail: `${failedLogins.length} failed login attempt${failedLogins.length > 1 ? 's' : ''}${hasSuccess ? ' followed by successful authentication' : ''}`,
+          evidence: [`${failedLogins.length} failed authentication events`, hasSuccess ? '✓ Successful login followed the failures — possible account takeover' : 'No subsequent successful login detected', failedLogins[0]?.parameters?.sourceIP ? `Source IP: ${failedLogins[0].parameters.sourceIP}` : null].filter(Boolean),
+          caseSummaryData: { type: 'bruteforce', count: failedLogins.length, takeover: hasSuccess },
           mitre: hasSuccess
             ? { id: 'T1110.004', name: 'Credential Stuffing', tactic: 'Credential Access' }
             : { id: 'T1110', name: 'Brute Force', tactic: 'Credential Access' },
@@ -521,7 +544,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         });
       }
 
-      // Rule 5: Session hijacking — same user active from multiple IPs with overlapping time windows
+      // ── Rule 5: Session hijacking / multi-IP ─────────────────────────────
       if (session.identifierType === 'user') {
         const ipTimestamps = {};
         session.events.forEach(e => {
@@ -545,20 +568,28 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
             }
           }
           if (overlapping.length >= 2) {
+            // Score scales with number of overlapping IPs
+            const hijack_conf = Math.min(72 + (overlapping.length - 2) * 6, 92);
             sessionFindings.push({
               type: 'Possible Session Hijacking',
-              confidence: 80,
+              confidence: hijack_conf,
               icon: '👥',
               detail: `User active simultaneously from ${overlapping.length} IPs: ${overlapping.join(', ')}`,
+              evidence: [`${overlapping.length} source IPs with overlapping active time windows`, `IPs: ${overlapping.join(', ')}`, 'Simultaneous activity from different IPs for the same account is a strong hijacking indicator'],
+              caseSummaryData: { type: 'hijacking', ips: overlapping },
               mitre: { id: 'T1563', name: 'Remote Service Session Hijacking', tactic: 'Lateral Movement' },
               mitigations: ['Invalidate all active sessions', 'Force re-authentication', 'Investigate both source IPs', 'Enable geo-velocity checks']
             });
           } else {
+            // Non-overlapping multi-IP: lower confidence
+            const multiip_conf = Math.min(30 + distinctIPs.length * 7, 52);
             sessionFindings.push({
               type: 'Multi-IP Access',
-              confidence: 55,
+              confidence: multiip_conf,
               icon: '🔀',
               detail: `Same user accessed from ${distinctIPs.length} different IPs: ${distinctIPs.join(', ')}`,
+              evidence: [`${distinctIPs.length} distinct source IPs used`, `IPs: ${distinctIPs.join(', ')}`, 'Non-overlapping — may indicate VPN switching or shared credential'],
+              caseSummaryData: { type: 'multiip', ips: distinctIPs },
               mitre: { id: 'T1078', name: 'Valid Accounts', tactic: 'Defense Evasion' },
               mitigations: ['Verify legitimate device switching', 'Check for shared credential use', 'Review access locations']
             });
@@ -566,39 +597,77 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         }
       }
 
-      // Rule 6: Endpoint enumeration — many distinct endpoint types hit in a short burst window
+      // ── Rule 6: Endpoint enumeration ──────────────────────────────────────
       if (session.events.length >= 5) {
         const sortedByTime = session.events
           .map(e => ({ type: e.eventType, ts: parseTimestampToSeconds(e.parameters.timestamp || '') }))
           .filter(e => e.ts !== null)
           .sort((a, b) => a.ts - b.ts);
-        let enumerationFlagged = false;
-        for (let i = 0; i < sortedByTime.length && !enumerationFlagged; i++) {
+        let bestEnumeration = null;
+        for (let i = 0; i < sortedByTime.length; i++) {
           const windowEnd = sortedByTime[i].ts + 120;
           const inWindow = sortedByTime.filter(e => e.ts >= sortedByTime[i].ts && e.ts <= windowEnd);
           const distinct = new Set(inWindow.map(e => e.type));
           if (distinct.size >= 4 && inWindow.length >= 6) {
-            sessionFindings.push({
-              type: 'Endpoint Enumeration',
-              confidence: 70,
-              icon: '📡',
-              detail: `${distinct.size} distinct endpoint types accessed within a 2-minute window`,
-              mitre: { id: 'T1046', name: 'Network Service Discovery', tactic: 'Discovery' },
-              mitigations: ['Enable anomaly-based rate limiting', 'Review all accessed endpoints', 'Audit authorization logs']
-            });
-            enumerationFlagged = true;
+            // Score: distinct types * 8 + extra events bonus, min 48
+            const enum_conf = Math.min(24 + distinct.size * 9 + Math.max(0, inWindow.length - 6) * 2, 88);
+            if (!bestEnumeration || enum_conf > bestEnumeration.score) {
+              bestEnumeration = { distinct, inWindow, score: enum_conf };
+            }
           }
+        }
+        if (bestEnumeration) {
+          sessionFindings.push({
+            type: 'Endpoint Enumeration',
+            confidence: bestEnumeration.score,
+            icon: '📡',
+            detail: `${bestEnumeration.distinct.size} distinct endpoint types accessed within a 2-minute window (${bestEnumeration.inWindow.length} requests)`,
+            evidence: [`${bestEnumeration.distinct.size} distinct endpoint types in 120s window`, `${bestEnumeration.inWindow.length} total requests in window`, `Types: ${[...bestEnumeration.distinct].join(', ')}`],
+            caseSummaryData: { type: 'enumeration', types: bestEnumeration.distinct.size, count: bestEnumeration.inWindow.length },
+            mitre: { id: 'T1046', name: 'Network Service Discovery', tactic: 'Discovery' },
+            mitigations: ['Enable anomaly-based rate limiting', 'Review all accessed endpoints', 'Audit authorization logs']
+          });
         }
       }
 
       if (sessionFindings.length > 0) {
+        // Sort findings within session by confidence desc
+        sessionFindings.sort((a, b) => b.confidence - a.confidence);
+        const maxConf = sessionFindings[0].confidence;
+        const tier = maxConf >= 88 ? 'critical' : maxConf >= 65 ? 'review' : 'info';
+
+        // Generate case summary paragraph
+        const topFinding = sessionFindings[0];
+        const d = topFinding.caseSummaryData || {};
+        let caseSummary = '';
+        const entity = session.identifierType === 'user' ? `User ${session.identifier}` : `IP ${session.identifier}`;
+        if (d.type === 'automation') {
+          caseSummary = `${entity} issued ${d.count} "${d.eventType}" requests with a near-constant interval of ${d.interval}s (σ = ${d.sigma}s). The request cadence is machine-consistent — this is not interactive human behavior. Likely a script, integration, or compromised automated process.`;
+        } else if (d.type === 'bruteforce') {
+          caseSummary = `${entity} generated ${d.count} authentication failures${d.takeover ? ', followed by a successful login — indicating likely account takeover' : ' with no subsequent success'}. This pattern is consistent with credential brute-forcing or a credential stuffing campaign.`;
+        } else if (d.type === 'hijacking') {
+          caseSummary = `${entity} was concurrently active from ${d.ips.length} different source IPs (${d.ips.join(', ')}). Simultaneous sessions from multiple IPs for the same account strongly suggest session token theft or credential sharing.`;
+        } else if (d.type === 'recon') {
+          caseSummary = `${entity} accessed ${d.types} distinct endpoint types across ${d.events} requests. This breadth-first access pattern is consistent with automated reconnaissance or API enumeration.`;
+        } else if (d.type === 'afterhours') {
+          caseSummary = `${entity} generated ${d.count} access events outside business hours${d.times?.length ? ` (${d.times.join(', ')})` : ''}. After-hours access without prior authorization may indicate compromised credentials or insider activity.`;
+        } else if (d.type === 'enumeration') {
+          caseSummary = `${entity} accessed ${d.types} distinct endpoint types within a 2-minute window across ${d.count} requests. This burst pattern is characteristic of automated endpoint discovery.`;
+        } else if (d.type === 'multiip') {
+          caseSummary = `${entity} accessed the system from ${d.ips.length} different source IPs. While potentially legitimate (VPN, mobile), this warrants verification — especially if IPs span different countries or networks.`;
+        } else {
+          caseSummary = `${entity} exhibited ${sessionFindings.length} behavioral anomal${sessionFindings.length > 1 ? 'ies' : 'y'} across ${session.events.length} events. Manual review is recommended.`;
+        }
+
         findings.push({
           identifier: session.identifier,
           identifierType: session.identifierType,
           totalEvents: session.events.length,
           uniqueEventTypes: session.eventTypes.size,
           behaviorSequence: buildBehaviorSequence(session.events),
-          riskScore: Math.max(...sessionFindings.map(f => f.confidence)),
+          riskScore: maxConf,
+          tier,
+          caseSummary,
           findings: sessionFindings
         });
       }
@@ -1199,6 +1268,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
   };
 
   const filteredResults = analysis?.results.filter(result => {
+    // Default: hide low-severity events unless user opts in
+    if (showSuspiciousOnly && result.threatLevel === 'low') return false;
+
     let matchesCategory = true;
     if (filterCategory === 'alerts') matchesCategory = result.isAlert;
     else if (filterCategory === 'bookmarked') matchesCategory = bookmarkedEvents.has(result.lineNumber);
@@ -1512,204 +1584,249 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
             )}
 
             {/* Investigation Findings */}
-            {analysis.investigation && analysis.investigation.length > 0 && (
-              <div className={`${darkMode ? 'bg-purple-900/20 border-purple-500/50' : 'bg-purple-50 border-purple-200'} rounded-lg p-6 mb-6 border-2`}>
-                <div className="flex items-center justify-between mb-4">
-                  <div className="flex items-center gap-2">
-                    <Search className="w-6 h-6 text-purple-400" />
-                    <h2 className={`text-2xl font-bold ${darkMode ? 'text-purple-400' : 'text-purple-700'}`}>
-                      Behavioral Investigation ({analysis.investigation.length} suspicious session{analysis.investigation.length !== 1 ? 's' : ''})
-                    </h2>
-                  </div>
-                  <button onClick={() => setShowInvestigation(!showInvestigation)} className={`p-2 rounded ${darkMode ? 'bg-white/10 hover:bg-white/20' : 'bg-purple-100 hover:bg-purple-200'} transition-all`}>
-                    {showInvestigation ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
-                  </button>
-                </div>
+            {analysis.investigation && analysis.investigation.length > 0 && (() => {
+              const inv = analysis.investigation;
+              const critical = inv.filter(s => s.tier === 'critical');
+              const review   = inv.filter(s => s.tier === 'review');
+              const info     = inv.filter(s => s.tier === 'info');
 
-                {showInvestigation && (
-                  <div className="space-y-4">
-                    {analysis.investigation.map((session, idx) => {
-                      const isCollapsed = collapsedSessions.has(idx);
-                      const toggleSession = () => {
-                        const next = new Set(collapsedSessions);
-                        next.has(idx) ? next.delete(idx) : next.add(idx);
-                        setCollapsedSessions(next);
-                      };
-                      return (
-                        <div key={idx} className={`${darkMode ? 'bg-slate-900/70' : 'bg-white'} rounded-lg border-l-4 overflow-hidden ${
-                          session.riskScore >= 90 ? 'border-red-500' : session.riskScore >= 70 ? 'border-orange-500' : 'border-yellow-500'
-                        }`}>
-                          {/* Session card header — always visible, click to collapse */}
-                          <button onClick={toggleSession} className="w-full p-5 text-left">
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-3 flex-wrap">
-                                <span className={`text-xs font-semibold px-2 py-1 rounded ${darkMode ? 'bg-blue-500/20 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
-                                  {session.identifierType === 'user' ? '👤 User' : '🌐 IP'}
-                                </span>
-                                <span className={`font-mono font-bold text-lg ${darkMode ? 'text-white' : 'text-gray-900'}`}>{session.identifier}</span>
-                                <span className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
-                                  {session.totalEvents} events · {session.findings.length} finding{session.findings.length !== 1 ? 's' : ''}
-                                </span>
-                              </div>
-                              <div className="flex items-center gap-3 flex-shrink-0">
-                                <div className="text-right">
-                                  <div className={`text-2xl font-bold ${session.riskScore >= 90 ? 'text-red-400' : session.riskScore >= 70 ? 'text-orange-400' : 'text-yellow-400'}`}>
-                                    {session.riskScore}<span className={`text-xs font-normal ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>/100</span>
-                                  </div>
-                                </div>
-                                {isCollapsed ? <ChevronDown className="w-4 h-4 text-gray-400" /> : <ChevronUp className="w-4 h-4 text-gray-400" />}
-                              </div>
+              const SESSION_PREVIEW = 5;
+              const visibleSessions = showAllSessions ? inv : inv.slice(0, SESSION_PREVIEW);
+              const hiddenCount = inv.length - SESSION_PREVIEW;
+
+              const SessionCard = ({ session, idx }) => {
+                const isExpanded = expandedSessions.has(idx);
+                const toggleSession = () => {
+                  const next = new Set(expandedSessions);
+                  next.has(idx) ? next.delete(idx) : next.add(idx);
+                  setExpandedSessions(next);
+                };
+                const topFinding = session.findings[0];
+                const borderColor = session.tier === 'critical' ? 'border-red-500' : session.tier === 'review' ? 'border-orange-400' : 'border-yellow-400';
+                const scoreColor = session.riskScore >= 88 ? 'text-red-400' : session.riskScore >= 65 ? 'text-orange-400' : 'text-yellow-400';
+
+                return (
+                  <div key={idx} className={`${darkMode ? 'bg-slate-900/70' : 'bg-white'} rounded-lg border-l-4 overflow-hidden shadow-sm ${borderColor}`}>
+                    {/* Collapsed header — always visible */}
+                    <button onClick={toggleSession} className="w-full p-4 text-left hover:bg-white/5 transition-colors">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-3 flex-wrap min-w-0">
+                          <span className={`text-xs font-semibold px-2 py-0.5 rounded shrink-0 ${darkMode ? 'bg-blue-500/20 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
+                            {session.identifierType === 'user' ? '👤 User' : '🌐 IP'}
+                          </span>
+                          <span className={`font-mono font-bold truncate ${darkMode ? 'text-white' : 'text-gray-900'}`}>{session.identifier}</span>
+                          {topFinding && (
+                            <span className={`text-xs truncate ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                              {topFinding.icon} {topFinding.type}
+                              {topFinding.mitre && <span className={`ml-2 font-mono ${darkMode ? 'text-purple-400' : 'text-purple-600'}`}>{topFinding.mitre.id}</span>}
+                            </span>
+                          )}
+                          <span className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{session.totalEvents} events</span>
+                        </div>
+                        <div className="flex items-center gap-3 shrink-0">
+                          <div className={`text-xl font-bold tabular-nums ${scoreColor}`}>
+                            {session.riskScore}<span className={`text-xs font-normal ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>/100</span>
+                          </div>
+                          {isExpanded ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
+                        </div>
+                      </div>
+                    </button>
+
+                    {/* Expanded body */}
+                    {isExpanded && (
+                      <div className="px-5 pb-5 border-t border-white/10">
+                        {/* Case Summary */}
+                        <div className={`mt-4 mb-5 p-4 rounded-lg ${darkMode ? 'bg-blue-950/40 border border-blue-500/20' : 'bg-blue-50 border border-blue-200'}`}>
+                          <div className={`text-xs font-bold tracking-widest mb-2 ${darkMode ? 'text-blue-400' : 'text-blue-600'}`}>ANALYST CASE SUMMARY</div>
+                          <p className={`text-sm leading-relaxed ${darkMode ? 'text-gray-200' : 'text-gray-700'}`}>{session.caseSummary}</p>
+                        </div>
+
+                        {/* Behavior Sequence */}
+                        {session.behaviorSequence.length > 0 && (
+                          <div className="mb-4">
+                            <div className={`text-xs font-semibold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-2`}>BEHAVIOR SEQUENCE</div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              {session.behaviorSequence.map((step, i) => (
+                                <React.Fragment key={i}>
+                                  {i > 0 && <span className={`${darkMode ? 'text-gray-600' : 'text-gray-400'} text-sm`}>→</span>}
+                                  <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                    step.count > 3
+                                      ? darkMode ? 'bg-red-900/40 text-red-300 border border-red-500/40' : 'bg-red-100 text-red-700 border border-red-200'
+                                      : darkMode ? 'bg-white/10 text-gray-300' : 'bg-gray-100 text-gray-700'
+                                  }`}>
+                                    {step.type}{step.count > 1 ? ` ×${step.count}` : ''}
+                                  </span>
+                                </React.Fragment>
+                              ))}
                             </div>
-                          </button>
+                          </div>
+                        )}
 
-                          {/* Collapsible body */}
-                          {!isCollapsed && (
-                            <div className="px-5 pb-5">
-                              {/* Behavior Sequence */}
-                              {session.behaviorSequence.length > 0 && (
-                                <div className="mb-4">
-                                  <div className={`text-xs font-semibold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-2`}>BEHAVIOR SEQUENCE</div>
-                                  <div className="flex items-center gap-2 flex-wrap">
-                                    {session.behaviorSequence.map((step, i) => (
-                                      <React.Fragment key={i}>
-                                        {i > 0 && <span className={`${darkMode ? 'text-gray-500' : 'text-gray-400'} text-sm`}>→</span>}
-                                        <span className={`px-2 py-1 rounded text-xs font-medium ${
-                                          step.count > 3
-                                            ? darkMode ? 'bg-red-900/40 text-red-300 border border-red-500/50' : 'bg-red-100 text-red-700 border border-red-300'
-                                            : darkMode ? 'bg-white/10 text-gray-300' : 'bg-gray-100 text-gray-700'
-                                        }`}>
-                                          {step.type}{step.count > 1 ? ` ×${step.count}` : ''}
-                                        </span>
-                                      </React.Fragment>
-                                    ))}
+                        {/* Findings */}
+                        <div className="space-y-3">
+                          {session.findings.map((finding, fi) => (
+                            <div key={fi} className={`rounded-lg p-4 ${
+                              finding.confidence >= 88
+                                ? darkMode ? 'bg-red-900/25 border border-red-500/30' : 'bg-red-50 border border-red-200'
+                                : finding.confidence >= 65
+                                  ? darkMode ? 'bg-orange-900/20 border border-orange-500/30' : 'bg-orange-50 border border-orange-200'
+                                  : darkMode ? 'bg-yellow-900/15 border border-yellow-500/20' : 'bg-yellow-50 border border-yellow-200'
+                            }`}>
+                              <div className="flex items-start justify-between mb-2 gap-2 flex-wrap">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-lg">{finding.icon}</span>
+                                  <span className={`font-bold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
+                                  {finding.mitre && (
+                                    <a href={`https://attack.mitre.org/techniques/${finding.mitre.id.replace('.', '/')}/`} target="_blank" rel="noopener noreferrer"
+                                      className="text-xs font-mono px-2 py-0.5 rounded border border-purple-500/50 text-purple-400 bg-purple-900/20 hover:bg-purple-800/30 transition-colors"
+                                      title={`${finding.mitre.name} · ${finding.mitre.tactic}`}>
+                                      {finding.mitre.id}
+                                    </a>
+                                  )}
+                                  {finding.mitre && (
+                                    <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'text-purple-300/70 bg-purple-900/10' : 'text-purple-600 bg-purple-50'}`}>
+                                      {finding.mitre.tactic}
+                                    </span>
+                                  )}
+                                </div>
+                                <span className={`text-xs font-bold px-2 py-1 rounded shrink-0 ${
+                                  finding.confidence >= 88 ? 'bg-red-500 text-white' :
+                                  finding.confidence >= 65 ? 'bg-orange-500 text-white' : 'bg-yellow-500 text-black'
+                                }`}>{finding.confidence}%</span>
+                              </div>
+                              <p className={`text-sm mb-3 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
+
+                              {/* Evidence bullets */}
+                              {finding.evidence && finding.evidence.length > 0 && (
+                                <ul className={`text-xs mb-3 space-y-1 pl-4 list-disc ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+                                  {finding.evidence.map((e, ei) => <li key={ei}>{e}</li>)}
+                                </ul>
+                              )}
+
+                              {/* Sparkline */}
+                              {finding.sparklineData && finding.sparklineData.length > 1 && (
+                                <div className="mb-3">
+                                  <div className={`text-xs font-semibold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-1`}>REQUEST INTERVAL PATTERN</div>
+                                  <div className={`rounded p-2 ${darkMode ? 'bg-black/30' : 'bg-white'}`}>
+                                    <ResponsiveContainer width="100%" height={56}>
+                                      <LineChart data={finding.sparklineData} margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
+                                        <Line type="monotone" dataKey="interval" stroke={finding.confidence >= 88 ? '#ef4444' : '#f97316'} strokeWidth={2} dot={{ r: 3 }} />
+                                        <Tooltip contentStyle={{ backgroundColor: darkMode ? '#1e293b' : '#fff', border: '1px solid #6366f1', borderRadius: '6px', fontSize: '11px' }}
+                                          formatter={(v) => [`${v}s`, 'Interval']} labelFormatter={(l) => `Request #${l}`} />
+                                      </LineChart>
+                                    </ResponsiveContainer>
+                                    <div className={`text-center text-xs mt-1 ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>Flat line = automation · Spiky = human</div>
                                   </div>
                                 </div>
                               )}
 
-                              {/* Findings */}
-                              <div className="space-y-3">
-                                {session.findings.map((finding, fi) => (
-                                  <div key={fi} className={`rounded-lg p-4 ${
-                                    finding.confidence >= 90
-                                      ? darkMode ? 'bg-red-900/25 border border-red-500/40' : 'bg-red-50 border border-red-200'
-                                      : finding.confidence >= 70
-                                        ? darkMode ? 'bg-orange-900/25 border border-orange-500/40' : 'bg-orange-50 border border-orange-200'
-                                        : darkMode ? 'bg-yellow-900/25 border border-yellow-500/40' : 'bg-yellow-50 border border-yellow-200'
-                                  }`}>
-                                    <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-                                      <div className="flex items-center gap-2 flex-wrap">
-                                        <span className="text-xl">{finding.icon}</span>
-                                        <span className={`font-bold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
-                                        {finding.mitre && (
-                                          <a
-                                            href={`https://attack.mitre.org/techniques/${finding.mitre.id.replace('.', '/')}/`}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="text-xs font-mono px-2 py-0.5 rounded border border-purple-500/50 text-purple-400 bg-purple-900/20 hover:bg-purple-800/30 transition-colors"
-                                            title={`MITRE ATT&CK: ${finding.mitre.name} (${finding.mitre.tactic})`}
-                                          >
-                                            {finding.mitre.id}
-                                          </a>
-                                        )}
-                                      </div>
-                                      <div className="flex items-center gap-2">
-                                        {finding.mitre && (
-                                          <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'text-purple-300 bg-purple-900/20' : 'text-purple-700 bg-purple-50'}`}>
-                                            {finding.mitre.tactic}
-                                          </span>
-                                        )}
-                                        <span className={`text-xs font-bold px-2 py-1 rounded ${
-                                          finding.confidence >= 90 ? 'bg-red-500 text-white' :
-                                          finding.confidence >= 70 ? 'bg-orange-500 text-white' : 'bg-yellow-500 text-black'
-                                        }`}>{finding.confidence}% confidence</span>
-                                      </div>
-                                    </div>
-                                    <p className={`text-sm mb-3 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
-
-                                    {/* Interval sparkline for automation findings */}
-                                    {finding.sparklineData && finding.sparklineData.length > 1 && (
-                                      <div className="mb-3">
-                                        <div className={`text-xs font-semibold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-1`}>REQUEST INTERVAL PATTERN</div>
-                                        <div className={`rounded p-2 ${darkMode ? 'bg-black/30' : 'bg-white'}`}>
-                                          <ResponsiveContainer width="100%" height={60}>
-                                            <LineChart data={finding.sparklineData} margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
-                                              <Line type="monotone" dataKey="interval" stroke={finding.confidence >= 90 ? '#ef4444' : '#f97316'} strokeWidth={2} dot={{ r: 3, fill: finding.confidence >= 90 ? '#ef4444' : '#f97316' }} />
-                                              <Tooltip
-                                                contentStyle={{ backgroundColor: darkMode ? '#1e293b' : '#fff', border: '1px solid #3b82f6', borderRadius: '6px', fontSize: '11px' }}
-                                                formatter={(v) => [`${v}s`, 'Interval']}
-                                                labelFormatter={(l) => `Request #${l}`}
-                                              />
-                                            </LineChart>
-                                          </ResponsiveContainer>
-                                          <div className={`text-center text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>
-                                            Flat = automation · Spiky = human
-                                          </div>
-                                        </div>
-                                      </div>
-                                    )}
-
-                                    <div className="flex flex-wrap gap-2">
-                                      {finding.mitigations.map((m, mi) => (
-                                        <span key={mi} className={`text-xs px-2 py-1 rounded ${darkMode ? 'bg-blue-900/30 text-blue-300 border border-blue-500/30' : 'bg-blue-50 text-blue-700 border border-blue-200'}`}>{m}</span>
-                                      ))}
-                                    </div>
-                                  </div>
+                              <div className="flex flex-wrap gap-2">
+                                {finding.mitigations.map((m, mi) => (
+                                  <span key={mi} className={`text-xs px-2 py-1 rounded ${darkMode ? 'bg-blue-900/30 text-blue-300 border border-blue-500/20' : 'bg-blue-50 text-blue-700 border border-blue-200'}`}>{m}</span>
                                 ))}
                               </div>
                             </div>
-                          )}
+                          ))}
                         </div>
-                      );
-                    })}
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-            )}
+                );
+              };
+
+              const TierGroup = ({ label, color, sessions, startIdx }) => {
+                if (sessions.length === 0) return null;
+                return (
+                  <div className="mb-5">
+                    <div className={`flex items-center gap-2 mb-3 pb-2 border-b ${darkMode ? 'border-white/10' : 'border-gray-200'}`}>
+                      <span className={`text-xs font-bold px-3 py-1 rounded-full ${color}`}>{label}</span>
+                      <span className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{sessions.length} session{sessions.length !== 1 ? 's' : ''}</span>
+                    </div>
+                    <div className="space-y-2">
+                      {sessions.map((s, i) => <SessionCard key={startIdx + i} session={s} idx={inv.indexOf(s)} />)}
+                    </div>
+                  </div>
+                );
+              };
+
+              // Filter visible sessions into tiers
+              const visibleCritical = visibleSessions.filter(s => s.tier === 'critical');
+              const visibleReview   = visibleSessions.filter(s => s.tier === 'review');
+              const visibleInfo     = visibleSessions.filter(s => s.tier === 'info');
+
+              return (
+                <div className={`${darkMode ? 'bg-purple-900/20 border-purple-500/40' : 'bg-purple-50 border-purple-200'} rounded-lg p-6 mb-6 border-2`}>
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <Search className="w-5 h-5 text-purple-400" />
+                      <h2 className={`text-xl font-bold ${darkMode ? 'text-purple-400' : 'text-purple-700'}`}>
+                        Behavioral Investigation
+                      </h2>
+                      <div className="flex gap-2">
+                        {critical.length > 0 && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-red-500/20 text-red-400 border border-red-500/30">🚨 {critical.length} Critical</span>}
+                        {review.length > 0 && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-orange-500/20 text-orange-400 border border-orange-500/30">⚠️ {review.length} Review</span>}
+                        {info.length > 0 && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30">ℹ️ {info.length} Info</span>}
+                      </div>
+                    </div>
+                    <button onClick={() => setShowInvestigation(!showInvestigation)} className={`p-2 rounded ${darkMode ? 'bg-white/10 hover:bg-white/20' : 'bg-purple-100 hover:bg-purple-200'} transition-all`}>
+                      {showInvestigation ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
+                    </button>
+                  </div>
+
+                  {showInvestigation && (
+                    <>
+                      <TierGroup label="🚨 Critical Investigations" color="bg-red-500/20 text-red-400 border border-red-500/30" sessions={visibleCritical} startIdx={0} />
+                      <TierGroup label="⚠️ Needs Review" color="bg-orange-500/20 text-orange-400 border border-orange-500/30" sessions={visibleReview} startIdx={visibleCritical.length} />
+                      <TierGroup label="ℹ️ Informational" color="bg-blue-500/20 text-blue-400 border border-blue-500/30" sessions={visibleInfo} startIdx={visibleCritical.length + visibleReview.length} />
+
+                      {inv.length > SESSION_PREVIEW && (
+                        <button
+                          onClick={() => setShowAllSessions(s => !s)}
+                          className={`mt-3 w-full py-2 rounded-lg text-sm font-semibold transition-all ${darkMode ? 'bg-white/5 hover:bg-white/10 text-gray-300 border border-white/10' : 'bg-white hover:bg-gray-50 text-gray-600 border border-gray-200'}`}
+                        >
+                          {showAllSessions ? `↑ Show top ${SESSION_PREVIEW} only` : `↓ Show ${hiddenCount} more session${hiddenCount !== 1 ? 's' : ''} (lower confidence)`}
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* Charts & Top IPs Section */}
             {showCharts && (
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-                {/* Severity Distribution Pie Chart */}
+                {/* Activity Timeline */}
                 <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} rounded-lg p-6 border`}>
-                  <h3 className={`text-lg font-semibold mb-4 flex items-center gap-2 ${darkMode ? '' : 'text-gray-900'}`}>
+                  <h3 className={`text-lg font-semibold mb-1 flex items-center gap-2 ${darkMode ? '' : 'text-gray-900'}`}>
                     <Activity className="w-5 h-5 text-blue-400" />
-                    Severity Distribution
+                    Activity Timeline
                   </h3>
-                  <ResponsiveContainer width="100%" height={250}>
-                    <PieChart>
-                      <Pie
-                        data={[
-                          { name: 'Critical', value: analysis.stats.critical, color: '#ef4444' },
-                          { name: 'High', value: analysis.stats.high, color: '#f97316' },
-                          { name: 'Medium', value: analysis.stats.medium, color: '#eab308' },
-                          { name: 'Low', value: analysis.stats.low, color: '#22c55e' }
-                        ].filter(item => item.value > 0)}
-                        cx="50%"
-                        cy="50%"
-                        outerRadius={80}
-                        dataKey="value"
-                        label={({ name, value, percent }) => `${name}: ${value} (${(percent * 100).toFixed(0)}%)`}
-                      >
-                        {[
-                          { name: 'Critical', value: analysis.stats.critical, color: '#ef4444' },
-                          { name: 'High', value: analysis.stats.high, color: '#f97316' },
-                          { name: 'Medium', value: analysis.stats.medium, color: '#eab308' },
-                          { name: 'Low', value: analysis.stats.low, color: '#22c55e' }
-                        ].filter(item => item.value > 0).map((entry, index) => (
-                          <Cell key={`cell-${index}`} fill={entry.color} />
-                        ))}
-                      </Pie>
-                      <Tooltip 
-                        contentStyle={{ 
-                          backgroundColor: darkMode ? '#1e293b' : '#ffffff', 
-                          border: '2px solid #3b82f6',
-                          borderRadius: '8px',
-                          color: darkMode ? '#e5e7eb' : '#000000'
-                        }}
-                        itemStyle={{ color: darkMode ? '#e5e7eb' : '#000000', fontWeight: 'bold' }}
+                  <p className={`text-xs mb-4 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Events by time period — spikes indicate bursts of activity</p>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <BarChart data={analysis.timeline} margin={{ top: 4, right: 8, bottom: 20, left: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={darkMode ? '#334155' : '#e2e8f0'} />
+                      <XAxis dataKey="time" tick={{ fontSize: 10, fill: darkMode ? '#94a3b8' : '#64748b' }} angle={-35} textAnchor="end" interval="preserveStartEnd" />
+                      <YAxis tick={{ fontSize: 10, fill: darkMode ? '#94a3b8' : '#64748b' }} />
+                      <Tooltip
+                        contentStyle={{ backgroundColor: darkMode ? '#1e293b' : '#ffffff', border: '1px solid #3b82f6', borderRadius: '8px', fontSize: '12px' }}
+                        labelStyle={{ color: darkMode ? '#e5e7eb' : '#1e293b', fontWeight: 600 }}
                       />
-                    </PieChart>
+                      <Bar dataKey="count" name="Events" fill="#3b82f6" radius={[3, 3, 0, 0]} />
+                    </BarChart>
                   </ResponsiveContainer>
+                  {/* Severity severity mini-bar */}
+                  <div className="mt-3 flex gap-1 rounded overflow-hidden h-2">
+                    {analysis.stats.critical > 0 && <div style={{ flex: analysis.stats.critical }} className="bg-red-500" title={`Critical: ${analysis.stats.critical}`} />}
+                    {analysis.stats.high > 0 && <div style={{ flex: analysis.stats.high }} className="bg-orange-400" title={`High: ${analysis.stats.high}`} />}
+                    {analysis.stats.medium > 0 && <div style={{ flex: analysis.stats.medium }} className="bg-yellow-400" title={`Medium: ${analysis.stats.medium}`} />}
+                    {analysis.stats.low > 0 && <div style={{ flex: analysis.stats.low }} className="bg-green-400" title={`Low: ${analysis.stats.low}`} />}
+                  </div>
+                  <div className="flex gap-4 mt-2">
+                    {[['Critical', analysis.stats.critical, 'text-red-400'], ['High', analysis.stats.high, 'text-orange-400'], ['Medium', analysis.stats.medium, 'text-yellow-400'], ['Low', analysis.stats.low, 'text-green-400']].map(([label, val, cls]) => (
+                      <span key={label} className={`text-xs ${cls}`}><strong>{val.toLocaleString()}</strong> {label}</span>
+                    ))}
+                  </div>
                 </div>
 
                 {/* Top Source IPs */}
@@ -1791,10 +1908,10 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               </div>
             </div>
 
-            {/* Filters and Search */}
-            <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} rounded-lg p-4 mb-6 border`}>
+            {/* Filters, Search, and Event Log */}
+            <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} rounded-lg p-4 mb-4 border`}>
               <div className="flex flex-col md:flex-row gap-4 items-start md:items-center justify-between">
-                <div className="flex flex-col md:flex-row items-start md:items-center gap-4 flex-1 flex-wrap">
+                <div className="flex flex-col md:flex-row items-start md:items-center gap-3 flex-1 flex-wrap">
                   <div className="flex items-center gap-2">
                     <Filter className="w-5 h-5 text-blue-400" />
                     <select value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)} className={`${darkMode ? 'bg-white/5 border-white/20 text-white' : 'bg-gray-50 border-gray-300 text-gray-900'} border rounded px-3 py-2 text-sm`}>
@@ -1804,56 +1921,67 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                       <option disabled>────────────────</option>
                       <option disabled>📊 Filter by Category:</option>
                       {Object.entries(analysis.stats.categoryBreakdown).sort(([,a], [,b]) => b - a).map(([cat, count]) => (
-                        <option key={cat} value={cat}>{eventCategories[cat]?.icon} {cat} ({count} matches)</option>
+                        <option key={cat} value={cat}>{eventCategories[cat]?.icon} {cat} ({count})</option>
                       ))}
                     </select>
                   </div>
 
                   <div className="flex items-center gap-2">
                     <select value={filterSeverity} onChange={(e) => setFilterSeverity(e.target.value)} className={`${darkMode ? 'bg-white/5 border-white/20 text-white' : 'bg-gray-50 border-gray-300 text-gray-900'} border rounded px-3 py-2 text-sm`}>
-                      <option value="all">All Severity Levels</option>
+                      <option value="all">All Severity</option>
                       <option value="critical">🔴 Critical ({analysis.stats.critical})</option>
                       <option value="high">🟠 High ({analysis.stats.high})</option>
                       <option value="medium">🟡 Medium ({analysis.stats.medium})</option>
                       <option value="low">🟢 Low ({analysis.stats.low})</option>
                     </select>
                   </div>
-                  
-                  <div className="flex items-center gap-2 flex-1 max-w-md">
-                    <Search className="w-5 h-5 text-blue-400" />
-                    <input type="text" placeholder="Search logs..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className={`${darkMode ? 'bg-white/5 border-white/20 text-white placeholder-gray-400' : 'bg-gray-50 border-gray-300 text-gray-900 placeholder-gray-500'} border rounded px-3 py-2 text-sm flex-1`} />
+
+                  <div className="flex items-center gap-2 flex-1 max-w-sm">
+                    <Search className="w-4 h-4 text-blue-400 shrink-0" />
+                    <input type="text" placeholder="Search logs…" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className={`${darkMode ? 'bg-white/5 border-white/20 text-white placeholder-gray-400' : 'bg-gray-50 border-gray-300 text-gray-900 placeholder-gray-500'} border rounded px-3 py-2 text-sm flex-1`} />
                   </div>
+
+                  {/* Suspicious-only toggle */}
+                  <button
+                    onClick={() => setShowSuspiciousOnly(v => !v)}
+                    className={`flex items-center gap-2 px-3 py-2 rounded text-sm font-semibold border transition-all ${showSuspiciousOnly ? 'bg-orange-500/20 border-orange-500/50 text-orange-400' : (darkMode ? 'bg-white/5 border-white/20 text-gray-400' : 'bg-gray-100 border-gray-300 text-gray-600')}`}
+                  >
+                    {showSuspiciousOnly ? <AlertTriangle className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    {showSuspiciousOnly ? 'Suspicious Only' : 'All Events'}
+                  </button>
 
                   {getActiveFilterName() && (
                     <div className="flex items-center gap-2">
                       <span className="px-3 py-1 bg-blue-500 text-white rounded-full text-sm font-medium">{getActiveFilterName()}</span>
-                      <button onClick={clearFilters} className="px-3 py-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 text-red-400 rounded-full text-sm font-medium transition-all">Clear</button>
+                      <button onClick={clearFilters} className="px-3 py-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 text-red-400 rounded-full text-sm transition-all">Clear</button>
                     </div>
                   )}
                 </div>
-                
-                <div className="flex gap-2">
-                  <button onClick={() => setShowCharts(!showCharts)} className="flex items-center gap-2 bg-purple-500/20 hover:bg-purple-500/30 border border-purple-500/50 rounded px-3 py-2 text-sm transition-all">
+
+                <div className="flex gap-2 shrink-0">
+                  <button onClick={() => setShowCharts(!showCharts)} className="flex items-center gap-1 bg-purple-500/20 hover:bg-purple-500/30 border border-purple-500/50 rounded px-3 py-2 text-sm transition-all">
                     {showCharts ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                     Charts
                   </button>
-                  <button onClick={() => exportResults('csv')} className="flex items-center gap-2 bg-green-500/20 hover:bg-green-500/30 border border-green-500/50 rounded px-3 py-2 text-sm transition-all">
-                    <Download className="w-4 h-4" />
-                    CSV
+                  <button onClick={() => exportResults('csv')} className="flex items-center gap-1 bg-green-500/20 hover:bg-green-500/30 border border-green-500/50 rounded px-3 py-2 text-sm transition-all">
+                    <Download className="w-4 h-4" />CSV
                   </button>
-                  <button onClick={() => exportResults('json')} className="flex items-center gap-2 bg-blue-500/20 hover:bg-blue-500/30 border border-blue-500/50 rounded px-3 py-2 text-sm transition-all">
-                    <Download className="w-4 h-4" />
-                    JSON
+                  <button onClick={() => exportResults('json')} className="flex items-center gap-1 bg-blue-500/20 hover:bg-blue-500/30 border border-blue-500/50 rounded px-3 py-2 text-sm transition-all">
+                    <Download className="w-4 h-4" />JSON
                   </button>
-                  <button onClick={generateReport} className="flex items-center gap-2 bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 text-red-400 rounded px-3 py-2 text-sm font-semibold transition-all">
-                    <FileText className="w-4 h-4" />
-                    PDF Report
+                  <button onClick={generateReport} className="flex items-center gap-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 text-red-400 rounded px-3 py-2 text-sm font-semibold transition-all">
+                    <FileText className="w-4 h-4" />PDF
                   </button>
                 </div>
               </div>
-              
+
               <div className={`mt-2 text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
                 Showing {filteredResults.length} of {analysis.results.length} events
+                {showSuspiciousOnly && analysis.stats.low > 0 && (
+                  <span className={`ml-2 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+                    · {analysis.stats.low.toLocaleString()} low-severity events hidden
+                  </span>
+                )}
               </div>
             </div>
 
