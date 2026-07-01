@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { Shield, AlertTriangle, FileText, Upload, Search, Filter, Download, Activity, Clock, Globe, BookmarkPlus, ChevronDown, ChevronUp, MapPin, Eye, EyeOff } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
 const LogAnalyzer = () => {
   const [uploadedFile, setUploadedFile] = useState(null);
@@ -13,7 +13,9 @@ const LogAnalyzer = () => {
   const [expandedEvent, setExpandedEvent] = useState(null);
   const [showCharts, setShowCharts] = useState(true);
   const [showInvestigation, setShowInvestigation] = useState(true);
-  const [collapsedSessions, setCollapsedSessions] = useState(new Set());
+  const [expandedSessions, setExpandedSessions] = useState(new Set()); // empty = all collapsed by default
+  const [showAllSessions, setShowAllSessions] = useState(false);
+  const [showSuspiciousOnly, setShowSuspiciousOnly] = useState(true);
   const [darkMode, setDarkMode] = useState(true);
   const [inputMode, setInputMode] = useState('upload');
   const [logText, setLogText] = useState('');
@@ -619,229 +621,458 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     if (!analysis) return;
     const timestamp = new Date().toLocaleString();
     const filename = analysis.stats.fileName || 'Unknown';
+    const inv = analysis.investigation || [];
+    const threats = analysis.threats || [];
 
-    // Top 10 source IPs
-    const ipCounts = {};
-    analysis.results.forEach(r => { const ip = r.parameters.sourceIP; if (ip) ipCounts[ip] = (ipCounts[ip] || 0) + 1; });
-    const topIPs = Object.entries(ipCounts).sort(([,a],[,b]) => b - a).slice(0, 10);
+    // ── helpers ────────────────────────────────────────────────────────────
+    const pct = (n) => analysis.stats.total > 0 ? ((n / analysis.stats.total) * 100).toFixed(1) : '0.0';
+    const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
-    // Category breakdown (sorted by count)
-    const catEntries = Object.entries(analysis.stats.categoryBreakdown).sort(([,a],[,b]) => b - a);
+    // Severity level + color
+    const overallRisk = analysis.stats.critical > 0 ? 'CRITICAL'
+      : analysis.stats.high > 10 ? 'HIGH'
+      : analysis.stats.high > 0 ? 'MEDIUM-HIGH'
+      : analysis.stats.medium > 0 ? 'MEDIUM' : 'LOW';
+    const riskBg = { CRITICAL:'#dc2626', HIGH:'#ea580c', 'MEDIUM-HIGH':'#d97706', MEDIUM:'#ca8a04', LOW:'#16a34a' }[overallRisk];
 
-    // Alert breakdown by severity
-    const severityPct = (n) => analysis.stats.total > 0 ? ((n / analysis.stats.total) * 100).toFixed(1) : '0.0';
+    // ── narrative: explain what drove severity counts ──────────────────────
+    const catEntries = Object.entries(analysis.stats.categoryBreakdown).sort(([,a],[,b]) => b-a);
+    const topCat = catEntries[0]?.[0] || 'Unknown';
+    const topCatCount = catEntries[0]?.[1] || 0;
+    const topCatPct = pct(topCatCount);
 
-    const threatRows = analysis.threats.map((t, i) => `
-      <div class="card ${t.severity}">
-        <div class="card-header">
-          <span class="card-num">[${i + 1}]</span>
-          <span class="card-title">${t.type}</span>
-          <span class="badge ${t.severity}">${t.severity.toUpperCase()}</span>
-        </div>
-        <p class="desc">${t.description}</p>
-        <p class="rec-label">Recommendation:</p>
-        <p class="desc">${t.recommendation}</p>
-        ${t.mitigation ? `<div class="chips">${t.mitigation.map(m => `<span class="chip">${m}</span>`).join('')}</div>` : ''}
-      </div>`).join('');
+    // Figure out dominant high-event driver
+    const highEvents = analysis.results.filter(r => r.threatLevel === 'high');
+    const highCatMap = {};
+    highEvents.forEach(r => r.categories.forEach(c => { highCatMap[c] = (highCatMap[c]||0)+1; }));
+    const topHighCat = Object.entries(highCatMap).sort(([,a],[,b])=>b-a)[0];
+    const highNarrative = analysis.stats.high > 0
+      ? (topHighCat
+          ? `The ${analysis.stats.high.toLocaleString()} High-severity events were predominantly driven by <strong>${topHighCat[0]}</strong> activity (${topHighCat[1].toLocaleString()} events, ${pct(topHighCat[1])}% of total). Review whether these represent confirmed malicious intent or expected operational traffic before escalating.`
+          : `${analysis.stats.high.toLocaleString()} events were classified High severity. Manual review is required to distinguish genuine threats from expected activity.`)
+      : 'No High-severity events were detected.';
 
-    const investigationRows = (analysis.investigation || []).map((session, i) => `
-      <div class="card ${session.riskScore >= 90 ? 'critical' : session.riskScore >= 70 ? 'high' : 'medium'}">
-        <div class="card-header">
-          <span class="card-num">[${i + 1}]</span>
-          <span class="card-title">${session.identifierType === 'user' ? '👤 User' : '🌐 IP'}: ${session.identifier}</span>
-          <span class="risk-badge">${session.riskScore}/100 Risk</span>
-        </div>
-        <p class="meta">${session.totalEvents} total events · ${session.uniqueEventTypes} endpoint type${session.uniqueEventTypes !== 1 ? 's' : ''}</p>
-        <p class="seq-label">Behavior Sequence:</p>
-        <div class="seq">${session.behaviorSequence.map(s => `${s.type}${s.count > 1 ? ` ×${s.count}` : ''}`).join(' → ')}</div>
-        ${session.findings.map(f => `
-          <div class="sub-card">
-            <div class="sub-header">
-              <span>${f.icon} ${f.type}</span>
-              <span class="conf">${f.confidence}% confidence</span>
-            </div>
-            <p class="desc">${f.detail}</p>
-            <div class="chips">${f.mitigations.map(m => `<span class="chip">${m}</span>`).join('')}</div>
-          </div>`).join('')}
-      </div>`).join('');
+    const critNarrative = analysis.stats.critical > 0
+      ? `<strong>${analysis.stats.critical.toLocaleString()} Critical events</strong> were detected. These require immediate triage — they match known attack signatures (brute force, active exploitation, or explicit intrusion indicators).`
+      : 'No Critical events were detected in this log file.';
 
-    const topIPRows = topIPs.map(([ip, count], i) => {
-      const intel = analysis.ipIntelligence[ip];
-      const riskColor = intel?.risk === 'High' ? '#dc2626' : intel?.risk === 'Medium' ? '#ea580c' : '#16a34a';
+    // ── top IPs (from ipProfiles) ──────────────────────────────────────────
+    const topIPs = Object.entries(analysis.ipProfiles || {})
+      .sort(([,a],[,b]) => b.events - a.events).slice(0, 10)
+      .map(([ip, p]) => ({ ip, ...p, intel: analysis.ipIntelligence?.[ip], users: [...p.users] }));
+
+    // ── unique affected users ──────────────────────────────────────────────
+    const userMap = {};
+    analysis.results.forEach(r => {
+      const u = r.parameters.user;
+      if (!u) return;
+      if (!userMap[u]) userMap[u] = { events: 0, threats: 0, failedLogins: 0, ips: new Set() };
+      userMap[u].events++;
+      if (r.isAlert) userMap[u].threats++;
+      if (r.categories.includes('Login Attempts') && /\b(fail|denied|invalid)\b/i.test(r.originalLog)) userMap[u].failedLogins++;
+      if (r.parameters.sourceIP) userMap[u].ips.add(r.parameters.sourceIP);
+    });
+    const topUsers = Object.entries(userMap).sort(([,a],[,b]) => b.threats - a.threats).slice(0, 10);
+
+    // ── evidence timeline: top 30 non-low events ──────────────────────────
+    const evidenceEvents = analysis.results
+      .filter(r => r.threatLevel !== 'low')
+      .slice(0, 30);
+
+    // ── category breakdown bar rows ───────────────────────────────────────
+    const maxCat = catEntries[0]?.[1] || 1;
+    const catRows = catEntries.slice(0, 14).map(([cat, count]) => {
+      const barW = Math.round((count / maxCat) * 100);
       return `<tr>
-        <td>${i + 1}</td>
-        <td style="font-family:monospace;font-weight:600">${ip}</td>
-        <td>${intel ? `${intel.country}, ${intel.city}` : '—'}</td>
-        <td>${intel?.isp || '—'}</td>
-        <td style="font-weight:700;color:${riskColor}">${intel?.risk || '—'}</td>
-        <td style="font-weight:700;color:#1e3a5f">${count}</td>
-      </tr>`;
-    }).join('');
-
-    const catRows = catEntries.slice(0, 12).map(([cat, count]) => {
-      const pct = analysis.stats.total > 0 ? ((count / analysis.stats.total) * 100).toFixed(1) : '0';
-      const barW = Math.round((count / (catEntries[0]?.[1] || 1)) * 100);
-      return `<tr>
-        <td>${cat}</td>
-        <td>
-          <div style="display:flex;align-items:center;gap:8px">
-            <div style="flex:1;height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden">
-              <div style="width:${barW}%;height:100%;background:#3b82f6;border-radius:4px"></div>
-            </div>
-            <span style="font-weight:700;color:#1e3a5f;min-width:36px;text-align:right">${count}</span>
+        <td>${esc(cat)}</td>
+        <td><div style="display:flex;align-items:center;gap:8px">
+          <div style="flex:1;height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden">
+            <div style="width:${barW}%;height:100%;background:#3b82f6;border-radius:4px"></div>
           </div>
-        </td>
-        <td style="color:#64748b">${pct}%</td>
+          <span style="font-weight:700;color:#1e3a5f;min-width:36px;text-align:right">${count.toLocaleString()}</span>
+        </div></td>
+        <td style="color:#64748b;white-space:nowrap">${pct(count)}%</td>
       </tr>`;
     }).join('');
 
-    const overallRisk = analysis.stats.critical > 0 ? 'CRITICAL' : analysis.stats.high > 10 ? 'HIGH' : analysis.stats.high > 0 ? 'MEDIUM-HIGH' : analysis.stats.medium > 0 ? 'MEDIUM' : 'LOW';
-    const riskColor = overallRisk === 'CRITICAL' ? '#dc2626' : overallRisk.startsWith('HIGH') || overallRisk === 'MEDIUM-HIGH' ? '#ea580c' : overallRisk === 'MEDIUM' ? '#ca8a04' : '#16a34a';
+    // ── threat cards ──────────────────────────────────────────────────────
+    const threatCards = threats.length > 0 ? threats.map((t, i) => {
+      const sev = t.severity || 'medium';
+      const evCount = t.evidence?.eventCount;
+      const ports = t.evidence?.ports?.length ? t.evidence.ports.slice(0,8).join(', ') : null;
+      const conf = t.evidence?.confidence;
+      return `<div class="card ${sev}">
+        <div class="card-header">
+          <span class="card-num">THREAT ${i+1}</span>
+          <span class="card-title">${esc(t.type)}</span>
+          <span class="badge ${sev}">${sev.toUpperCase()}</span>
+        </div>
+        ${t.sourceIP ? `<div class="meta-pill">Source IP: <strong>${esc(t.sourceIP)}</strong></div>` : ''}
+        <p class="desc">${esc(t.description)}</p>
+        ${evCount !== undefined ? `<div class="evidence-row"><span>📊 ${evCount} matching events</span>${ports ? `<span>🔌 Ports: ${esc(ports)}</span>` : ''}${conf ? `<span>🎯 ${conf}% confidence</span>` : ''}</div>` : ''}
+        <p class="rec-label">Recommendation</p>
+        <p class="desc">${esc(t.recommendation)}</p>
+        ${t.mitigation?.length ? `<div class="chips">${t.mitigation.map(m=>`<span class="chip">${esc(m)}</span>`).join('')}</div>` : ''}
+      </div>`;
+    }).join('') : `<div class="clean-card">✅ No confirmed threats detected. Monitor for emerging patterns.</div>`;
 
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CyberNyx Security Report — ${filename}</title><style>
+    // ── investigation finding cards ───────────────────────────────────────
+    const invCards = inv.length > 0 ? inv.map((session, i) => {
+      const riskCls = session.riskScore >= 90 ? 'critical' : session.riskScore >= 70 ? 'high' : 'medium';
+      const subCards = session.findings.map(f => {
+        const confCls = f.confidence >= 90 ? 'conf-crit' : f.confidence >= 70 ? 'conf-high' : 'conf-med';
+        const mitreBadge = f.mitre ? `<span class="mitre-badge">${esc(f.mitre.id)}</span><span class="tactic-badge">${esc(f.mitre.tactic)}</span>` : '';
+        return `<div class="sub-card">
+          <div class="sub-header">
+            <span>${f.icon} <strong>${esc(f.type)}</strong> ${mitreBadge}</span>
+            <span class="conf ${confCls}">${f.confidence}% confidence</span>
+          </div>
+          <p class="desc">${esc(f.detail)}</p>
+          ${f.mitre ? `<p class="mitre-line">MITRE ATT&amp;CK · <strong>${esc(f.mitre.id)}</strong> · ${esc(f.mitre.name)} · Tactic: ${esc(f.mitre.tactic)}</p>` : ''}
+          <div class="chips">${(f.mitigations||[]).map(m=>`<span class="chip">${esc(m)}</span>`).join('')}</div>
+        </div>`;
+      }).join('');
+
+      const seqText = session.behaviorSequence.map(s=>`${s.type}${s.count>1?` ×${s.count}`:''}`).join(' → ');
+      return `<div class="card ${riskCls}">
+        <div class="card-header">
+          <span class="card-num">FINDING ${i+1}</span>
+          <span class="card-title">${session.identifierType === 'user' ? '👤' : '🌐'} ${esc(session.identifier)}</span>
+          <span class="risk-score" style="color:${riskCls==='critical'?'#dc2626':riskCls==='high'?'#ea580c':'#ca8a04'}">${session.riskScore}/100</span>
+        </div>
+        <div class="meta">${session.totalEvents} events · ${session.uniqueEventTypes} endpoint types</div>
+        <div class="seq-label">Behavior Sequence</div>
+        <div class="seq">${esc(seqText)}</div>
+        ${subCards}
+      </div>`;
+    }).join('') : `<div class="clean-card">✅ No suspicious behavioral sessions detected.</div>`;
+
+    // ── affected users table ──────────────────────────────────────────────
+    const userRows = topUsers.length > 0 ? topUsers.map(([u, d]) => `<tr>
+      <td style="font-family:monospace;font-weight:600">${esc(u)}</td>
+      <td>${d.events.toLocaleString()}</td>
+      <td style="font-weight:700;color:${d.threats>0?'#ea580c':'#16a34a'}">${d.threats}</td>
+      <td style="color:${d.failedLogins>0?'#dc2626':'#334155'}">${d.failedLogins}</td>
+      <td>${[...d.ips].slice(0,3).join(', ')}</td>
+    </tr>`).join('') : `<tr><td colspan="5" style="color:#94a3b8;text-align:center">No authenticated user activity found</td></tr>`;
+
+    // ── affected IPs table ────────────────────────────────────────────────
+    const ipRows = topIPs.map((item, i) => {
+      const riskColor = item.intel?.risk==='High'?'#dc2626':item.intel?.risk==='Medium'?'#ea580c':'#16a34a';
+      return `<tr>
+        <td>${i+1}</td>
+        <td style="font-family:monospace;font-weight:600">${esc(item.ip)}</td>
+        <td>${item.intel?`${esc(item.intel.country)}, ${esc(item.intel.city)}`:'—'}</td>
+        <td style="font-weight:700;color:${riskColor}">${item.intel?.risk||'—'}</td>
+        <td>${item.events.toLocaleString()}</td>
+        <td style="color:${item.threats>0?'#ea580c':'#16a34a'}">${item.threats}</td>
+        <td style="color:${item.failedLogins>0?'#dc2626':'#334155'}">${item.failedLogins}</td>
+      </tr>`;
+    }).join('');
+
+    // ── evidence timeline ─────────────────────────────────────────────────
+    const sevColor = {critical:'#dc2626',high:'#ea580c',medium:'#ca8a04',low:'#64748b'};
+    const sevBg = {critical:'#fef2f2',high:'#fff7ed',medium:'#fefce8',low:'#f8fafc'};
+    const timelineRows = evidenceEvents.map((r, i) => {
+      const ts = r.parameters.timestamp || '—';
+      const user = r.parameters.user ? `<span style="color:#1d4ed8;font-size:11px">👤 ${esc(r.parameters.user)}</span>` : '';
+      const ip = r.parameters.sourceIP ? `<span style="color:#64748b;font-size:11px">🌐 ${esc(r.parameters.sourceIP)}</span>` : '';
+      return `<div style="display:flex;gap:0;margin-bottom:2px;align-items:stretch">
+        <div style="width:3px;background:${sevColor[r.threatLevel]||'#94a3b8'};border-radius:2px;flex-shrink:0"></div>
+        <div style="flex:1;padding:8px 12px;background:${sevBg[r.threatLevel]||'#f8fafc'};border-radius:0 6px 6px 0;margin-left:2px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;flex-wrap:wrap;gap:4px">
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <span style="font-family:monospace;font-size:11px;color:#64748b">${esc(ts)}</span>
+              <span style="font-size:11px;font-weight:700;color:${sevColor[r.threatLevel]||'#64748b'};text-transform:uppercase">${r.threatLevel}</span>
+              <span style="font-size:12px;font-weight:600;color:#1e3a5f">${esc(r.eventType)}</span>
+            </div>
+            <div style="display:flex;gap:8px">${user}${ip}</div>
+          </div>
+          <div style="font-family:monospace;font-size:11px;color:#475569;word-break:break-all">${esc(r.originalLog.slice(0,180))}${r.originalLog.length>180?'…':''}</div>
+        </div>
+      </div>`;
+    }).join('');
+
+    // ── recommendations ───────────────────────────────────────────────────
+    const recs = [];
+    // Session-specific recommendations
+    inv.slice(0, 5).forEach(session => {
+      session.findings.forEach(f => {
+        if (f.type === 'Automated API Polling') {
+          recs.push({ priority:'HIGH', action:`Investigate ${session.identifierType === 'user' ? 'user' : 'IP'} <strong>${esc(session.identifier)}</strong> for scripted/automated access`, detail:`${f.detail}. Verify if this is an authorized integration. If not, rotate credentials and block.` });
+        } else if (f.type.includes('Brute Force') || f.type.includes('Credential')) {
+          recs.push({ priority:'CRITICAL', action:`Lock account <strong>${esc(session.identifier)}</strong> and force password reset`, detail:`${f.detail}. Block source IP(s) and audit all successful logins from this account in the last 30 days.` });
+        } else if (f.type.includes('Hijacking')) {
+          recs.push({ priority:'HIGH', action:`Invalidate all active sessions for <strong>${esc(session.identifier)}</strong>`, detail:`${f.detail}. Investigate both source IPs and enable geo-velocity alerting.` });
+        } else if (f.type.includes('After-Hours')) {
+          recs.push({ priority:'MEDIUM', action:`Review after-hours activity for <strong>${esc(session.identifier)}</strong>`, detail:`${f.detail}. Confirm legitimate access or investigate for insider threat / compromised credentials.` });
+        }
+      });
+    });
+    // Threat-specific recommendations
+    threats.forEach(t => {
+      if (t.sourceIP) recs.push({ priority: t.severity.toUpperCase(), action: `Block source IP <strong>${esc(t.sourceIP)}</strong> at the perimeter firewall`, detail: t.description });
+    });
+    // Fallback generic recs
+    if (recs.length === 0) {
+      recs.push({ priority:'LOW', action:'Continue routine log monitoring', detail:'No specific actionable indicators identified. Maintain current security posture and review alert thresholds quarterly.' });
+    }
+    recs.push({ priority:'INFO', action:`Schedule follow-up review within ${analysis.stats.critical > 0 ? '24 hours' : '7 days'}`, detail:'Re-analyze after any remediation steps to confirm threats are neutralized.' });
+
+    const recPriorityColor = {CRITICAL:'#dc2626',HIGH:'#ea580c','MEDIUM-HIGH':'#d97706',MEDIUM:'#ca8a04',LOW:'#16a34a',INFO:'#3b82f6'};
+    const recCards = recs.map((r,i) => `<div class="rec-card">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <span style="font-size:11px;font-weight:800;padding:2px 10px;border-radius:99px;background:${recPriorityColor[r.priority]||'#64748b'};color:white">${r.priority}</span>
+        <span style="font-weight:700;color:#1e3a5f;font-size:13px">${r.action}</span>
+      </div>
+      <p style="font-size:12px;color:#475569;line-height:1.5">${r.detail}</p>
+    </div>`).join('');
+
+    // ── appendix: top 50 non-low events ───────────────────────────────────
+    const appendixEvents = analysis.results.filter(r=>r.threatLevel!=='low').slice(0,50);
+    const appendixRows = appendixEvents.map(r=>`<tr>
+      <td style="font-family:monospace;font-size:11px;color:#64748b">${esc(r.parameters.timestamp||'—')}</td>
+      <td><span style="font-size:10px;font-weight:700;padding:1px 7px;border-radius:99px;background:${sevColor[r.threatLevel]||'#94a3b8'};color:white">${r.threatLevel.toUpperCase()}</span></td>
+      <td style="font-size:12px;color:#1e3a5f;font-weight:600">${esc(r.eventType)}</td>
+      <td style="font-family:monospace;font-size:10px;color:#475569;word-break:break-all">${esc(r.originalLog.slice(0,120))}${r.originalLog.length>120?'…':''}</td>
+    </tr>`).join('');
+
+    // ── CSS ───────────────────────────────────────────────────────────────
+    const css = `
       *{margin:0;padding:0;box-sizing:border-box}
-      body{font-family:'Segoe UI',Arial,sans-serif;color:#1a1a2e;background:#fff;padding:40px;max-width:980px;margin:0 auto;line-height:1.5}
-      @media print{body{padding:20px}.no-print{display:none}@page{margin:18mm;size:A4}}
-      .report-header{border-bottom:3px solid #3b82f6;padding-bottom:20px;margin-bottom:32px}
-      .logo{background:linear-gradient(135deg,#3b82f6,#06b6d4);color:white;padding:5px 14px;border-radius:8px;font-size:13px;font-weight:800;margin-right:12px;letter-spacing:.02em}
-      .report-title{font-size:26px;font-weight:800;color:#1e3a5f;display:flex;align-items:center;margin-bottom:8px}
-      .report-meta{color:#64748b;font-size:13px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-      .dot{color:#cbd5e1}
-      .overall-risk{display:inline-block;padding:3px 12px;border-radius:99px;font-size:12px;font-weight:800;background:${riskColor};color:white;margin-left:4px}
-      .section{margin-bottom:36px}
-      .section-title{font-size:13px;font-weight:700;color:#1e3a5f;border-left:4px solid #3b82f6;padding-left:10px;margin-bottom:16px;text-transform:uppercase;letter-spacing:.07em}
-      .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
-      .stat-box{border-radius:10px;padding:16px;text-align:center}
-      .stat-box.critical{background:#fef2f2;border:1px solid #fca5a5}.stat-box.high{background:#fff7ed;border:1px solid #fed7aa}
-      .stat-box.medium{background:#fefce8;border:1px solid #fde68a}.stat-box.low{background:#f0fdf4;border:1px solid #86efac}
-      .stat-num{font-size:34px;font-weight:800;line-height:1}
+      body{font-family:'Segoe UI',Arial,sans-serif;color:#1a1a2e;background:#fff;padding:40px;max-width:960px;margin:0 auto;line-height:1.55}
+      @media print{body{padding:20px;font-size:12px}.no-print{display:none!important}@page{margin:15mm;size:A4}
+        .page-break{page-break-before:always}.avoid-break{page-break-inside:avoid}}
+      h1{font-size:28px;font-weight:800;color:#1e3a5f}
+      h2{font-size:13px;font-weight:700;color:#1e3a5f;border-left:4px solid #3b82f6;padding-left:10px;margin-bottom:14px;text-transform:uppercase;letter-spacing:.07em}
+      .section{margin-bottom:40px}
+      /* Cover */
+      .cover{border-bottom:4px solid #3b82f6;padding-bottom:28px;margin-bottom:36px}
+      .logo{background:linear-gradient(135deg,#3b82f6,#06b6d4);color:white;padding:5px 14px;border-radius:8px;font-size:14px;font-weight:800;display:inline-block;margin-bottom:14px;letter-spacing:.02em}
+      .report-meta{color:#64748b;font-size:13px;margin-top:10px;display:flex;gap:14px;flex-wrap:wrap}
+      .risk-badge{display:inline-block;padding:5px 18px;border-radius:99px;font-size:13px;font-weight:800;background:${riskBg};color:white;margin-left:6px;vertical-align:middle}
+      /* Stats */
+      .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+      .stat-box{border-radius:10px;padding:16px 12px;text-align:center;border:1px solid}
+      .stat-box.critical{background:#fef2f2;border-color:#fca5a5}.stat-box.high{background:#fff7ed;border-color:#fed7aa}
+      .stat-box.medium{background:#fefce8;border-color:#fde68a}.stat-box.low{background:#f0fdf4;border-color:#86efac}
+      .stat-num{font-size:32px;font-weight:800;line-height:1}
       .stat-box.critical .stat-num{color:#dc2626}.stat-box.high .stat-num{color:#ea580c}
       .stat-box.medium .stat-num{color:#ca8a04}.stat-box.low .stat-num{color:#16a34a}
       .stat-label{font-size:10px;color:#64748b;font-weight:700;margin-top:5px;text-transform:uppercase;letter-spacing:.05em}
-      .summary-row{display:flex;gap:20px;flex-wrap:wrap;color:#334155;font-size:13px;padding:12px 16px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0}
-      .summary-row strong{color:#1e3a5f}
-      .two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
-      table{width:100%;border-collapse:collapse;font-size:13px}
-      th{text-align:left;padding:8px 10px;background:#f1f5f9;color:#475569;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid #e2e8f0}
-      td{padding:8px 10px;border-bottom:1px solid #f1f5f9;color:#334155;vertical-align:middle}
-      tr:last-child td{border-bottom:none}
+      .stat-reason{font-size:10px;color:#94a3b8;margin-top:3px;line-height:1.4}
+      .summary-pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+      .pill{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:99px;padding:4px 12px;font-size:12px;color:#334155}
+      .pill strong{color:#1e3a5f}
+      /* Narrative */
+      .narrative{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px 20px;font-size:13px;color:#334155;line-height:1.7;margin-bottom:16px}
+      .narrative strong{color:#1e3a5f}
+      /* Cards */
       .card{border-radius:8px;padding:16px;margin-bottom:12px;border-left:4px solid}
       .card.critical{background:#fef2f2;border-color:#dc2626}.card.high{background:#fff7ed;border-color:#ea580c}
       .card.medium{background:#fefce8;border-color:#ca8a04}.card.low{background:#f0fdf4;border-color:#16a34a}
       .card-header{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
-      .card-num{color:#94a3b8;font-size:11px;font-weight:700}
+      .card-num{color:#94a3b8;font-size:10px;font-weight:700;letter-spacing:.05em}
       .card-title{font-weight:700;font-size:15px;color:#1e3a5f;flex:1}
       .badge{padding:2px 10px;border-radius:99px;font-size:11px;font-weight:700}
       .badge.critical{background:#dc2626;color:white}.badge.high{background:#ea580c;color:white}
       .badge.medium{background:#ca8a04;color:white}.badge.low{background:#16a34a;color:white}
-      .risk-badge{font-weight:800;color:#dc2626;font-size:15px}
+      .risk-score{font-size:15px;font-weight:800}
+      .meta-pill{display:inline-block;background:#e0f2fe;color:#0369a1;border-radius:99px;padding:2px 10px;font-size:11px;font-weight:600;margin-bottom:8px}
+      .evidence-row{display:flex;gap:14px;font-size:12px;color:#475569;margin:6px 0 8px;flex-wrap:wrap}
       .desc{color:#475569;font-size:13px;margin-bottom:8px;line-height:1.6}
       .rec-label{font-size:10px;font-weight:700;color:#3b82f6;margin-bottom:3px;text-transform:uppercase;letter-spacing:.04em}
       .meta{font-size:12px;color:#64748b;margin-bottom:10px}
       .seq-label{font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
       .seq{font-family:'Consolas',monospace;font-size:12px;color:#1e3a5f;background:#f1f5f9;padding:10px 14px;border-radius:6px;margin-bottom:12px;word-break:break-word;line-height:1.7}
       .sub-card{background:white;border-radius:6px;padding:12px;margin-top:10px;border:1px solid #e2e8f0}
-      .sub-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px}
-      .sub-header span:first-child{font-weight:700;font-size:13px;color:#1e3a5f}
-      .conf{font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;background:#dc2626;color:white}
+      .sub-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;flex-wrap:wrap;gap:6px}
+      .sub-header>span:first-child{font-size:13px;color:#1e3a5f;flex:1}
+      .conf{font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;color:white}
+      .conf-crit{background:#dc2626}.conf-high{background:#ea580c}.conf-med{background:#ca8a04}
+      .mitre-badge{font-family:monospace;font-size:11px;padding:1px 7px;border-radius:4px;background:#ede9fe;color:#7c3aed;font-weight:700;margin-left:4px}
+      .tactic-badge{font-size:10px;padding:1px 7px;border-radius:4px;background:#f3f4f6;color:#6b7280;margin-left:4px}
+      .mitre-line{font-size:11px;color:#7c3aed;background:#ede9fe;padding:4px 10px;border-radius:4px;margin:6px 0}
       .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
       .chip{font-size:11px;padding:3px 10px;border-radius:99px;background:#dbeafe;color:#1d4ed8;font-weight:600}
       .clean-card{background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:16px;color:#15803d;font-weight:600;display:flex;align-items:center;gap:8px}
-      .recs{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-      .rec-item{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:12px;font-size:13px;color:#334155}
-      .rec-item strong{display:block;color:#1e3a5f;margin-bottom:3px;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
-      .footer{margin-top:48px;padding-top:16px;border-top:2px solid #e2e8f0;color:#94a3b8;font-size:11px;display:flex;justify-content:space-between;align-items:center}
+      /* Tables */
+      table{width:100%;border-collapse:collapse;font-size:13px}
+      th{text-align:left;padding:8px 10px;background:#f1f5f9;color:#475569;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid #e2e8f0}
+      td{padding:8px 10px;border-bottom:1px solid #f1f5f9;color:#334155;vertical-align:middle}
+      tr:hover td{background:#fafafa}
+      /* Recommendations */
+      .rec-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:14px 16px;margin-bottom:10px}
+      /* Footer */
+      .footer{margin-top:48px;padding-top:16px;border-top:2px solid #e2e8f0;color:#94a3b8;font-size:11px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
       .footer .brand{color:#3b82f6;font-weight:700}
-      .print-btn{position:fixed;top:20px;right:20px;background:#3b82f6;color:white;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;box-shadow:0 4px 14px rgba(59,130,246,.35);display:flex;align-items:center;gap:6px}
+      .print-btn{position:fixed;top:20px;right:20px;background:#3b82f6;color:white;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;box-shadow:0 4px 14px rgba(59,130,246,.35);z-index:999}
       .print-btn:hover{background:#2563eb}
-    </style></head><body>
-      <button class="print-btn no-print" onclick="window.print()">&#x1F4BE; Save as PDF</button>
+      .section-num{color:#3b82f6;font-weight:800;margin-right:6px}
+    `;
 
-      <div class="report-header">
-        <div class="report-title"><span class="logo">CyberNyx</span>Security Investigation Report</div>
-        <div class="report-meta">
-          <span>Generated: <strong>${timestamp}</strong></span>
-          <span class="dot">·</span>
-          <span>Source: <strong>${filename}</strong></span>
-          <span class="dot">·</span>
-          <span>Overall Risk: <span class="overall-risk">${overallRisk}</span></span>
-        </div>
-      </div>
+    const html = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CyberNyx Security Report — ${esc(filename)}</title>
+<style>${css}</style>
+</head><body>
 
-      <div class="section">
-        <div class="section-title">Executive Summary</div>
-        <div class="stats-grid">
-          <div class="stat-box critical"><div class="stat-num">${analysis.stats.critical}</div><div class="stat-label">Critical</div></div>
-          <div class="stat-box high"><div class="stat-num">${analysis.stats.high}</div><div class="stat-label">High Risk</div></div>
-          <div class="stat-box medium"><div class="stat-num">${analysis.stats.medium}</div><div class="stat-label">Medium Risk</div></div>
-          <div class="stat-box low"><div class="stat-num">${analysis.stats.low}</div><div class="stat-label">Low Risk</div></div>
-        </div>
-        <div class="summary-row">
-          <span><strong>${analysis.stats.total.toLocaleString()}</strong> total events</span>
-          <span><strong>${analysis.stats.alerts}</strong> alerts (${severityPct(analysis.stats.alerts)}%)</span>
-          <span><strong>${analysis.stats.uniqueIPs}</strong> unique IPs</span>
-          <span><strong>${Object.keys(analysis.stats.categoryBreakdown).length}</strong> event categories</span>
-          <span><strong>${analysis.threats.length}</strong> active threat${analysis.threats.length !== 1 ? 's' : ''}</span>
-          <span><strong>${(analysis.investigation || []).length}</strong> suspicious session${(analysis.investigation || []).length !== 1 ? 's' : ''}</span>
-        </div>
-      </div>
+<button class="print-btn no-print" onclick="window.print()">&#x1F4BE; Save as PDF</button>
 
-      ${analysis.threats.length > 0 ? `
-      <div class="section">
-        <div class="section-title">Active Threats Detected (${analysis.threats.length})</div>
-        ${threatRows}
-      </div>` : `
-      <div class="section">
-        <div class="clean-card">✅ No active threats detected in this log file.</div>
-      </div>`}
+<!-- COVER -->
+<div class="cover">
+  <div class="logo">⚡ CyberNyx</div>
+  <h1>Security Investigation Report</h1>
+  <div style="margin-top:10px;font-size:16px;color:#475569">
+    Overall Risk Assessment: <span class="risk-badge">${overallRisk}</span>
+  </div>
+  <div class="report-meta">
+    <span>📁 Source: <strong>${esc(filename)}</strong></span>
+    <span>🕐 Generated: <strong>${timestamp}</strong></span>
+    <span>📊 ${analysis.stats.total.toLocaleString()} total events</span>
+    <span>🔍 ${analysis.stats.uniqueIPs} unique IPs</span>
+  </div>
+</div>
 
-      ${(analysis.investigation || []).length > 0 ? `
-      <div class="section">
-        <div class="section-title">Behavioral Investigation — ${(analysis.investigation || []).length} Suspicious Session${(analysis.investigation || []).length !== 1 ? 's' : ''}</div>
-        ${investigationRows}
-      </div>` : `
-      <div class="section">
-        <div class="section-title">Behavioral Investigation</div>
-        <div class="clean-card">✅ No suspicious behavioral patterns detected. Sessions appear within normal parameters.</div>
-      </div>`}
+<!-- 1. EXECUTIVE SUMMARY -->
+<div class="section">
+  <h2><span class="section-num">1</span>Executive Summary</h2>
+  <div class="stats-grid">
+    <div class="stat-box critical">
+      <div class="stat-num">${analysis.stats.critical.toLocaleString()}</div>
+      <div class="stat-label">Critical</div>
+      <div class="stat-reason">${analysis.stats.critical > 0 ? 'Immediate action required' : 'None detected'}</div>
+    </div>
+    <div class="stat-box high">
+      <div class="stat-num">${analysis.stats.high.toLocaleString()}</div>
+      <div class="stat-label">High</div>
+      <div class="stat-reason">${analysis.stats.high > 0 ? 'Review within 24 hours' : 'None detected'}</div>
+    </div>
+    <div class="stat-box medium">
+      <div class="stat-num">${analysis.stats.medium.toLocaleString()}</div>
+      <div class="stat-label">Medium</div>
+      <div class="stat-reason">${analysis.stats.medium > 0 ? 'Investigate this week' : 'None detected'}</div>
+    </div>
+    <div class="stat-box low">
+      <div class="stat-num">${analysis.stats.low.toLocaleString()}</div>
+      <div class="stat-label">Low / Info</div>
+      <div class="stat-reason">Routine activity</div>
+    </div>
+  </div>
+  <div class="summary-pills">
+    <span class="pill"><strong>${analysis.stats.total.toLocaleString()}</strong> events parsed</span>
+    <span class="pill"><strong>${analysis.stats.uniqueIPs}</strong> unique source IPs</span>
+    <span class="pill"><strong>${Object.keys(analysis.stats.categoryBreakdown).length}</strong> event categories</span>
+    <span class="pill"><strong>${threats.length}</strong> active threat${threats.length!==1?'s':''}</span>
+    <span class="pill"><strong>${inv.length}</strong> suspicious session${inv.length!==1?'s':''}</span>
+    <span class="pill"><strong>${topUsers.length}</strong> affected user${topUsers.length!==1?'s':''}</span>
+  </div>
+</div>
 
-      <div class="section">
-        <div class="section-title">Event Category Breakdown</div>
-        <table>
-          <thead><tr><th>Category</th><th>Distribution</th><th>% of Total</th></tr></thead>
-          <tbody>${catRows}</tbody>
-        </table>
-      </div>
+<!-- 2. KEY FINDINGS NARRATIVE -->
+<div class="section">
+  <h2><span class="section-num">2</span>Key Findings — Why It Matters</h2>
+  <div class="narrative">${critNarrative}</div>
+  <div class="narrative">${highNarrative}</div>
+  ${inv.length > 0 ? `<div class="narrative">
+    The behavioral analysis engine identified <strong>${inv.length} suspicious session${inv.length!==1?'s':''}</strong>.
+    The highest-risk entity is <strong>${esc(inv[0].identifier)}</strong> (risk score ${inv[0].riskScore}/100),
+    flagged for: ${inv[0].findings.map(f=>`<strong>${esc(f.type)}</strong>`).join(', ')}.
+    ${inv[0].findings[0]?.mitre ? `This maps to MITRE ATT&amp;CK technique <strong>${esc(inv[0].findings[0].mitre.id)} — ${esc(inv[0].findings[0].mitre.name)}</strong>.` : ''}
+  </div>` : ''}
+  ${threats.length > 0 ? `<div class="narrative">
+    <strong>${threats.length} confirmed threat${threats.length!==1?'s were':' was'} detected</strong>:
+    ${threats.map(t=>`<strong>${esc(t.type)}</strong>`).join(', ')}.
+    ${threats.some(t=>t.sourceIP) ? `Source IPs involved: ${[...new Set(threats.filter(t=>t.sourceIP).map(t=>t.sourceIP))].join(', ')}.` : ''}
+  </div>` : ''}
+</div>
 
-      ${topIPs.length > 0 ? `
-      <div class="section">
-        <div class="section-title">Top Source IPs by Activity</div>
-        <table>
-          <thead><tr><th>#</th><th>IP Address</th><th>Location</th><th>ISP / Network</th><th>Risk</th><th>Events</th></tr></thead>
-          <tbody>${topIPRows}</tbody>
-        </table>
-      </div>` : ''}
+<!-- 3. ACTIVE THREATS -->
+<div class="section page-break avoid-break">
+  <h2><span class="section-num">3</span>Active Threats (${threats.length})</h2>
+  ${threatCards}
+</div>
 
-      <div class="section">
-        <div class="section-title">General Security Recommendations</div>
-        <div class="recs">
-          <div class="rec-item"><strong>Log Retention</strong>Ensure logs are retained for at least 90 days and backed up to a tamper-proof store for forensic use.</div>
-          <div class="rec-item"><strong>Alert Tuning</strong>${analysis.stats.critical > 0 ? `${analysis.stats.critical} critical events require immediate triage. Review and escalate as appropriate.` : 'No critical events found. Continue routine monitoring and review alert thresholds.'}</div>
-          <div class="rec-item"><strong>IP Monitoring</strong>${topIPs.length > 0 ? `Top activity from ${topIPs[0]?.[0]} (${topIPs[0]?.[1]} events). ${analysis.ipIntelligence[topIPs[0]?.[0]]?.risk === 'High' ? 'This IP is flagged HIGH risk — review immediately.' : 'Review activity patterns for anomalies.'}` : 'No significant IP activity patterns found.'}</div>
-          <div class="rec-item"><strong>Authentication</strong>${analysis.threats.some(t => /brute|credential|login/i.test(t.type)) ? 'Brute force activity detected. Enforce account lockout, MFA, and rate limiting on auth endpoints.' : 'No authentication attacks detected. Maintain strong password policies and MFA.'}</div>
-          <div class="rec-item"><strong>Network Security</strong>${analysis.threats.some(t => /port scan|ddos/i.test(t.type)) ? 'Port scan or DDoS activity found. Review firewall rules, enable IDS/IPS, and consider geo-blocking.' : 'No network-level attacks detected. Keep firewall rules and IDS signatures updated.'}</div>
-          <div class="rec-item"><strong>Next Review</strong>Schedule follow-up analysis within 24 hours if any critical threats are present, otherwise within 7 days.</div>
-        </div>
-      </div>
+<!-- 4. INVESTIGATION FINDINGS -->
+<div class="section page-break">
+  <h2><span class="section-num">4</span>Behavioral Investigation Findings (${inv.length})</h2>
+  ${invCards}
+</div>
 
-      <div class="footer">
-        <span><span class="brand">CyberNyx</span> Log Analyzer — Auto-generated report</span>
-        <span>${timestamp}</span>
-        <span>Review with a qualified security analyst before acting on findings.</span>
-      </div>
-    </body></html>`;
-    const w = window.open('', '_blank');
-    if (w) { w.document.write(html); w.document.close(); }
+<!-- 5. AFFECTED USERS -->
+<div class="section page-break">
+  <h2><span class="section-num">5</span>Affected Users</h2>
+  <table>
+    <thead><tr><th>User / Account</th><th>Events</th><th>Alerts</th><th>Failed Logins</th><th>Source IPs</th></tr></thead>
+    <tbody>${userRows}</tbody>
+  </table>
+</div>
+
+<!-- 6. AFFECTED IPs -->
+<div class="section">
+  <h2><span class="section-num">6</span>Top Source IPs</h2>
+  <table>
+    <thead><tr><th>#</th><th>IP Address</th><th>Location</th><th>Risk</th><th>Events</th><th>Alerts</th><th>Failed Logins</th></tr></thead>
+    <tbody>${ipRows || '<tr><td colspan="7" style="text-align:center;color:#94a3b8">No source IP data</td></tr>'}</tbody>
+  </table>
+</div>
+
+<!-- 7. EVIDENCE TIMELINE -->
+<div class="section page-break">
+  <h2><span class="section-num">7</span>Evidence Timeline — Top ${evidenceEvents.length} Non-Low Events</h2>
+  <div style="margin-top:4px">${timelineRows || '<div class="clean-card">✅ No medium/high/critical events to display.</div>'}</div>
+</div>
+
+<!-- 8. RECOMMENDATIONS -->
+<div class="section page-break">
+  <h2><span class="section-num">8</span>Recommendations</h2>
+  ${recCards}
+</div>
+
+<!-- 9. CATEGORY BREAKDOWN -->
+<div class="section">
+  <h2><span class="section-num">9</span>Event Category Breakdown</h2>
+  <table>
+    <thead><tr><th>Category</th><th>Distribution</th><th>% of Total</th></tr></thead>
+    <tbody>${catRows}</tbody>
+  </table>
+</div>
+
+<!-- APPENDIX -->
+<div class="section page-break">
+  <h2>Appendix — Raw Event Log (Top ${appendixEvents.length} Non-Low Events)</h2>
+  <p style="font-size:12px;color:#64748b;margin-bottom:12px">Only Medium, High, and Critical events are included. Low-severity events (routine web traffic, static assets) are excluded from this appendix to keep the report concise.</p>
+  <table>
+    <thead><tr><th>Timestamp</th><th>Severity</th><th>Type</th><th>Raw Log</th></tr></thead>
+    <tbody>${appendixRows || '<tr><td colspan="4" style="text-align:center;color:#94a3b8">No events to display</td></tr>'}</tbody>
+  </table>
+</div>
+
+<div class="footer">
+  <span><span class="brand">CyberNyx</span> Log Analyzer — Auto-generated Security Report</span>
+  <span>${timestamp}</span>
+  <span>⚠️ Review with a qualified analyst before acting on findings.</span>
+</div>
+
+</body></html>`;
+
+    // Use Blob URL — avoids popup blocker that kills document.write approach
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const w = window.open(url, '_blank');
+    if (!w) {
+      // Fallback: trigger download if popup was blocked
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `cybernyx-report-${Date.now()}.html`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+    // Revoke after a delay so the new tab has time to load
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
   };
 
   const handleFileUpload = async (event) => {
