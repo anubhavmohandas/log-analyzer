@@ -74,19 +74,21 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
 2024-11-09 10:45:22 WARNING: Unusual outbound traffic detected - 500MB in 5 minutes to 203.0.113.200`
   };
 
+  const STATIC_ASSET_RE = /\.(css|js|mjs|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map|webp|avif|otf|mp4|mp3)(\?[^"'\s]*)?(\s|"|'|$)/i;
+
   const eventCategories = {
-    'Login Attempts': { patterns: [/login|logon|authentication|signin|sign-in|auth/i, /failed.*password|invalid.*credentials|auth.*fail/i, /successful.*login|logged in|authentication.*success/i, /ssh|telnet|rdp|ftp.*login/i], icon: '🔐', color: 'blue' },
+    'Login Attempts': { patterns: [/login.*(success|fail|attempt|denied)|authentication.*(success|fail|error)/i, /failed.*password|invalid.*credentials|auth.*fail|login.*fail/i, /successful.*login|logged in|authentication.*success|login success/i, /\b(ssh|rdp|telnet|ftp)\b.*(login|auth|connect)/i, /\b(401|403)\b.*auth|auth.*\b(401|403)\b/i], icon: '🔐', color: 'blue' },
     'Network Changes': { patterns: [/interface.*up|interface.*down|link.*up|link.*down/i, /route.*add|route.*del|routing.*change/i, /vlan.*config|port.*config|switch.*config/i, /network.*change|topology.*change/i], icon: '🌐', color: 'cyan' },
-    'Firewall Actions': { patterns: [/deny|drop|block|reject|discard/i, /permit|allow|accept|pass/i, /firewall.*rule|acl|access.*list/i, /src=|dst=|proto=/i], icon: '🛡️', color: 'purple' },
-    'Configuration Changes': { patterns: [/config.*change|configuration|configured from/i, /policy.*change|rule.*change|setting.*change/i, /admin|administrator|root|sudo/i, /modify|update|edit.*config/i], icon: '⚙️', color: 'yellow' },
-    'System Events': { patterns: [/start|started|stop|stopped|restart|reboot/i, /service.*up|service.*down|daemon/i, /system.*error|kernel|crash|panic/i, /job.*start|job.*end|process/i], icon: '💻', color: 'green' },
-    'Security Alerts': { patterns: [/attack|intrusion|breach|exploit|vulnerability/i, /malware|virus|trojan|backdoor|ransomware/i, /suspicious|anomaly|unusual|unauthorized/i, /scan|probe|flood|ddos/i], icon: '🚨', color: 'red' },
-    'Access Control': { patterns: [/permission|privilege|access.*denied|forbidden/i, /unauthorized|unauthenticated/i, /role.*change|group.*add|user.*add/i, /sudo|su|privilege.*escalation/i], icon: '🔒', color: 'orange' },
-    'Data Transfer': { patterns: [/transfer|upload|download|file.*transfer/i, /bytes.*sent|bytes.*received|traffic/i, /ftp|sftp|scp|http.*post/i, /data.*sent|data.*received/i], icon: '📡', color: 'indigo' },
-    'Port Activity': { patterns: [/port.*\d+|destination.*port|source.*port/i, /22|23|80|443|3389|445|3306|1433|5432/, /ssh.*port|rdp.*port|http.*port/i, /port.*scan|port.*probe/i], icon: '🔌', color: 'teal' },
-    'Session Management': { patterns: [/session.*start|session.*end|session.*expire/i, /connection.*establish|connection.*close/i, /timeout|idle|disconnect/i, /keepalive|heartbeat/i], icon: '🔗', color: 'pink' },
-    'Resource Alerts': { patterns: [/cpu|memory|disk|ram/i, /threshold|usage|capacity/i, /resource|performance/i, /overload|exhaustion/i], icon: '⚡', color: 'amber' },
-    'Error Events': { patterns: [/error|fail|failure|fatal/i, /exception|abort|crash/i, /timeout|unreachable/i, /corrupt|invalid/i], icon: '❌', color: 'rose' }
+    'Firewall Actions': { patterns: [/action=(deny|block|drop|reject|permit|allow)/i, /firewall.*rule|acl|access.*list/i, /src=.*dst=|proto=\w+.*src=/i, /\bDeny\b.*\bpolicy\b|\bpermit\b.*\bpolicy\b/i], icon: '🛡️', color: 'purple' },
+    'Configuration Changes': { patterns: [/config.*change|configuration|configured from/i, /policy.*change|rule.*change|setting.*change/i, /admin.*config|root.*config/i, /\bmodify\b|\bedit.*config\b/i], icon: '⚙️', color: 'yellow' },
+    'System Events': { patterns: [/\b(started|stopped|restarted|rebooted)\b/i, /service.*up|service.*down|daemon\b/i, /system.*error|kernel|crash|panic/i, /\bboot\b.*complet/i], icon: '💻', color: 'green' },
+    'Security Alerts': { patterns: [/\b(attack|intrusion|breach|exploit|vulnerability)\b/i, /malware|virus|trojan|backdoor|ransomware/i, /port.*scan|port scan|scan.*detect/i, /\b(ddos|flood)\b/i], icon: '🚨', color: 'red' },
+    'Access Control': { patterns: [/access.*denied|forbidden|privilege.*escal/i, /\bunauthorized\b|\bunauthenticated\b/i, /role.*change|group.*add|user.*add/i, /sudo|privilege.*escalat/i], icon: '🔒', color: 'orange' },
+    'Data Transfer': { patterns: [/\b(upload|download|file.*transfer|exfil)\b/i, /bytes.*sent|bytes.*received|sent=\d+.*rcvd=\d+/i, /\b(sftp|scp)\b|http.*post.*large/i, /unusual.*traffic|abnormal.*transfer/i], icon: '📡', color: 'indigo' },
+    'Port Activity': { patterns: [/port.*scan|port scan|\bsyn.*flood\b/i, /\b(ssh|rdp|telnet)\b.*\b(refused|scan|probe|attempt)\b/i, /dport=\d+|dst_port=\d+|destination.*port.*\d+/i, /connection.*refused.*port|port.*unreachable/i], icon: '🔌', color: 'teal' },
+    'Session Management': { patterns: [/session.*(start|end|expire|creat)/i, /connection.*(establish|close|terminat)/i, /\btimeout\b|\bidle\b|\bdisconnect\b/i], icon: '🔗', color: 'pink' },
+    'Resource Alerts': { patterns: [/\b(cpu|memory|disk|ram)\b.*(usage|critical|high|\d{2,3}%)/i, /\d{2,3}%.*\b(cpu|memory|disk)\b/i, /\b(overload|exhaustion|threshold)\b/i], icon: '⚡', color: 'amber' },
+    'Error Events': { patterns: [/\b(error|fatal|exception|abort|crash|panic)\b/i, /\b(5\d\d)\b.*HTTP|\bHTTP.*\b(5\d\d)\b/i, /corrupt|invalid.*data/i], icon: '❌', color: 'rose' }
   };
 
   const detectEventType = (logLine) => {
@@ -153,94 +155,188 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     const interfacePattern = /(?:interface|int)[:\s]+(\S+)/i;
     const interfaceMatch = logLine.match(interfacePattern);
     if (interfaceMatch) params.interface = interfaceMatch[1];
-    
+
+    // HTTP status code (space-delimited 3-digit code)
+    const statusMatch = logLine.match(/\s(2\d\d|3\d\d|4\d\d|5\d\d)\s/);
+    if (statusMatch) params.statusCode = statusMatch[1];
+
+    // URL path from HTTP method line
+    const urlMatch = logLine.match(/(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([^\s"]+)/i);
+    if (urlMatch) params.url = urlMatch[1];
+
     return params;
   };
 
   const assessThreatLevel = (categories, logLine, params) => {
-    const highRiskCategories = ['Security Alerts', 'Access Control', 'Error Events'];
-    const mediumRiskCategories = ['Login Attempts', 'Firewall Actions', 'Port Activity'];
-    const hasHighRisk = categories.some(cat => highRiskCategories.includes(cat));
-    const hasMediumRisk = categories.some(cat => mediumRiskCategories.includes(cat));
-    
-    if (/fail|deny|reject|block|error|unauthorized|critical/i.test(logLine)) {
-      if (hasHighRisk || /critical|attack|breach|exploit/i.test(logLine)) return 'critical';
-      return 'high';
+    // Static assets are always informational regardless of other signals
+    const url = params.url || '';
+    if (STATIC_ASSET_RE.test(url) || STATIC_ASSET_RE.test(logLine)) return 'low';
+
+    const status = params.statusCode || '';
+    // 2xx/3xx on non-static paths are low unless other signals fire
+    const isSuccessResponse = /^2\d\d$/.test(status) || /^3\d\d$/.test(status);
+
+    // Definite attack language → critical
+    if (/\b(attack|breach|exploit|intrusion|ransomware|malware|backdoor|rootkit|ddos)\b/i.test(logLine)) return 'critical';
+
+    // Explicit scan/probe + port activity → high
+    if (/\b(port.*scan|port scan|syn.*flood|scan.*detect)\b/i.test(logLine)) return 'high';
+
+    // Brute force / credential spray indicators → high
+    if (/\b(brute.?force|credential.*stuff|account.*lock)\b/i.test(logLine)) return 'high';
+
+    const hasSecurityAlert = categories.includes('Security Alerts');
+    const hasAccessControl = categories.includes('Access Control');
+
+    // Explicit denial/block from firewall/ACL
+    if (categories.includes('Firewall Actions') && /\b(deny|block|drop|reject)\b/i.test(logLine)) return 'medium';
+
+    // 401/403 responses — medium (not high; single 403 is routine)
+    if (/^40[13]$/.test(status)) return 'medium';
+
+    // Unauthorized / access denied keywords — but not in static-asset context
+    if (/\bunauthorized\b|\baccess denied\b|\bforbidden\b/i.test(logLine)) {
+      if (hasSecurityAlert || hasAccessControl) return 'high';
+      return 'medium';
     }
-    if (hasHighRisk) return 'high';
-    if (hasMediumRisk) return 'medium';
+
+    // Login/auth failures — medium (brute force is caught earlier with explicit keyword)
+    if (categories.includes('Login Attempts') && /\b(fail|denied|invalid|bad.*password)\b/i.test(logLine)) return 'medium';
+
+    // Critical resource state
+    if (categories.includes('Resource Alerts') && /\b(critical|exhausted|overload)\b/i.test(logLine)) return 'high';
+
+    // Server errors (5xx) on non-static paths
+    if (/^5\d\d$/.test(status)) return 'medium';
+
+    // Suspicious data transfer
+    if (categories.includes('Data Transfer') && /\b(unusual|abnormal|exfil)\b/i.test(logLine)) return 'high';
+
+    if (hasSecurityAlert) return 'high';
+    if (hasAccessControl && !isSuccessResponse) return 'medium';
+
     return 'low';
   };
 
   const detectAdvancedThreats = (events) => {
     const threats = [];
+    // ip → { failedIdxs, ports, timestamps, destIPs }
     const ipFailures = {};
-    const portScans = {};
+    const portScansByIP = {};
+    const seenThreatSigs = new Set();
+
+    const addThreat = (t) => {
+      const sig = t.type + '|' + (t.sourceIP || '') + '|' + (t.description || '').slice(0, 60);
+      if (seenThreatSigs.has(sig)) return;
+      seenThreatSigs.add(sig);
+      threats.push(t);
+    };
 
     events.forEach((event, idx) => {
       const ip = event.parameters.sourceIP || 'unknown';
+      const logLine = event.originalLog || '';
 
-      if (event.categories.includes('Login Attempts') && /fail|denied/i.test(event.originalLog)) {
-        ipFailures[ip] = ipFailures[ip] || [];
-        ipFailures[ip].push(idx);
+      // --- Brute force / credential attack ---
+      if (event.categories.includes('Login Attempts') && /\b(fail|denied|invalid|bad.*password|auth.*fail)\b/i.test(logLine)) {
+        if (!ipFailures[ip]) ipFailures[ip] = { idxs: [], timestamps: [] };
+        ipFailures[ip].idxs.push(idx);
+        if (event.parameters.timestamp) ipFailures[ip].timestamps.push(event.parameters.timestamp);
 
-        if (ipFailures[ip].length >= 3) {
-          threats.push({
+        if (ipFailures[ip].idxs.length === 3) {
+          const timeRange = ipFailures[ip].timestamps.length >= 2
+            ? ` between ${ipFailures[ip].timestamps[0]} – ${ipFailures[ip].timestamps[ipFailures[ip].timestamps.length - 1]}`
+            : '';
+          addThreat({
             type: 'Brute Force Attack',
             severity: 'critical',
-            description: `${ipFailures[ip].length} failed login attempts from IP: ${ip}`,
+            sourceIP: ip,
+            description: `${ipFailures[ip].idxs.length}+ failed login attempts from ${ip}${timeRange}`,
             recommendation: 'Block this IP immediately using firewall rules. Review authentication logs for successful logins. Implement account lockout policies.',
             mitigation: ['Block IP: ' + ip, 'Enable rate limiting', 'Implement CAPTCHA', 'Enable 2FA', 'Review password policies']
           });
         }
       }
 
-      if (event.eventType === 'Port Scan Detected' || (event.categories.includes('Port Activity') && event.categories.includes('Security Alerts'))) {
-        portScans[ip] = portScans[ip] || [];
-        portScans[ip].push(idx);
-        if (portScans[ip].length >= 2) {
-          threats.push({
-            type: 'Port Scan Attack',
-            severity: 'high',
-            description: `Multiple port scans from ${ip}`,
-            recommendation: 'This is reconnaissance activity. Investigate source IP and implement rate limiting. Enable IDS/IPS.',
-            mitigation: ['Block IP: ' + ip, 'Enable IDS/IPS', 'Implement rate limiting', 'Review open ports', 'Monitor for follow-up attacks']
-          });
-        }
+      // --- Port scan detection ---
+      const isPortScan = /\b(port.*scan|port scan|syn.*flood|scan.*detect)\b/i.test(logLine)
+        || (event.categories.includes('Port Activity') && event.categories.includes('Security Alerts'));
+      if (isPortScan) {
+        if (!portScansByIP[ip]) portScansByIP[ip] = { idxs: [], ports: new Set(), timestamps: [], destIPs: new Set() };
+        portScansByIP[ip].idxs.push(idx);
+        if (event.parameters.timestamp) portScansByIP[ip].timestamps.push(event.parameters.timestamp);
+        if (event.parameters.port) portScansByIP[ip].ports.add(event.parameters.port);
+        if (event.parameters.destinationIP) portScansByIP[ip].destIPs.add(event.parameters.destinationIP);
+        // Also pick up any bare port number from dport=/dst_port= notation
+        const dportMatch = logLine.match(/\b(?:dport|dst_port|destination.*port)[=:\s]+(\d+)/i);
+        if (dportMatch) portScansByIP[ip].ports.add(dportMatch[1]);
       }
 
-      if (/icmp.*packet|ping.*flood|large.*packet/i.test(event.originalLog)) {
-        threats.push({
+      // --- DDoS ---
+      if (/icmp.*packet|ping.*flood|large.*packet/i.test(logLine)) {
+        addThreat({
           type: 'Possible DDoS Attack',
           severity: 'critical',
-          description: 'Large ICMP packets detected - potential DDoS attack',
+          sourceIP: ip,
+          description: `Large ICMP packets / flood traffic detected from ${ip !== 'unknown' ? ip : 'multiple sources'}`,
           recommendation: 'Enable rate limiting immediately. Contact ISP for upstream filtering if needed.',
           mitigation: ['Enable rate limiting', 'Activate anti-DDoS rules', 'Contact ISP', 'Monitor bandwidth', 'Consider DDoS protection service']
         });
       }
 
-      if (event.threatLevel === 'critical' && /disk|memory|cpu/i.test(event.originalLog)) {
-        threats.push({
+      // --- Resource exhaustion ---
+      if (event.threatLevel === 'critical' && /\b(disk|memory|cpu)\b/i.test(logLine)) {
+        addThreat({
           type: 'Resource Exhaustion',
           severity: 'critical',
-          description: 'Critical resource usage - possible DoS or system failure',
+          description: 'Critical resource usage — possible DoS or system failure',
           recommendation: 'Investigate top processes immediately. Check for malicious activity or resource attacks.',
           mitigation: ['Identify resource-consuming processes', 'Kill suspicious processes', 'Clear logs/temp files', 'Check for attacks', 'Scale infrastructure']
         });
       }
 
-      if (event.categories.includes('Data Transfer') && /unusual|abnormal|large/i.test(event.originalLog)) {
-        threats.push({
+      // --- Suspicious data transfer ---
+      if (event.categories.includes('Data Transfer') && /\b(unusual|abnormal|exfil)\b/i.test(logLine)) {
+        addThreat({
           type: 'Suspicious Data Transfer',
           severity: 'high',
-          description: 'Unusual data transfer detected - possible exfiltration',
+          sourceIP: ip,
+          description: `Unusual data transfer detected from ${ip} — possible exfiltration`,
           recommendation: 'Review destination IPs. Check for unauthorized transfers. Analyze traffic patterns.',
           mitigation: ['Review destination IPs', 'Block suspicious destinations', 'Investigate source', 'Check for unauthorized access', 'Review DLP policies']
         });
       }
     });
 
-    return threats.filter((threat, index, self) => index === self.findIndex((t) => t.type === threat.type && t.description === threat.description));
+    // Emit port scan findings with full evidence
+    Object.entries(portScansByIP).forEach(([ip, data]) => {
+      if (data.idxs.length < 2) return;
+      const portList = data.ports.size > 0 ? [...data.ports].sort((a, b) => Number(a) - Number(b)) : [];
+      const destList = data.destIPs.size > 0 ? [...data.destIPs] : [];
+      const timeRange = data.timestamps.length >= 2
+        ? `${data.timestamps[0]} – ${data.timestamps[data.timestamps.length - 1]}`
+        : (data.timestamps[0] || 'unknown time');
+      const portDesc = portList.length > 0
+        ? `targeting port${portList.length > 1 ? 's' : ''} ${portList.slice(0, 8).join(', ')}${portList.length > 8 ? '…' : ''}`
+        : 'across multiple ports';
+      const destDesc = destList.length > 0 ? ` → destination${destList.length > 1 ? 's' : ''}: ${destList.slice(0, 3).join(', ')}` : '';
+      addThreat({
+        type: 'Port Scan Attack',
+        severity: 'high',
+        sourceIP: ip,
+        description: `${data.idxs.length} scan events from ${ip} ${portDesc}${destDesc} (${timeRange})`,
+        evidence: {
+          eventCount: data.idxs.length,
+          ports: portList,
+          destinations: destList,
+          timeRange,
+          confidence: Math.min(50 + data.idxs.length * 5, 95)
+        },
+        recommendation: 'Reconnaissance activity detected. Block source IP, enable IDS/IPS, and audit all open ports.',
+        mitigation: ['Block IP: ' + ip, 'Enable IDS/IPS', 'Implement port-level rate limiting', 'Audit open services', 'Monitor for follow-up exploitation']
+      });
+    });
+
+    return threats;
   };
 
   const generateIPIntelligence = (ip) => {
@@ -343,14 +439,15 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       let bestAutomation = null;
       Object.entries(typeGroups).forEach(([type, evts]) => {
         if (evts.length < 4) return;
-        const stats = computeIntervalStats(evts.map(e => e.parameters.timestamp).filter(Boolean));
+        const tsList = evts.map(e => e.parameters.timestamp).filter(Boolean);
+        const stats = computeIntervalStats(tsList);
         if (!stats) return;
         const cv = stats.stdDev / stats.mean;
         let score = cv < 0.03 ? 95 : cv < 0.10 ? 80 : cv < 0.20 ? 65 : cv < 0.35 ? 45 : 0;
         if (score === 0) return;
         if (evts.length >= 10) score = Math.min(score + 4, 99);
         if (!bestAutomation || score > bestAutomation.score) {
-          const sortedTs = timestamps
+          const sortedTs = tsList
             .map(ts => ({ ts, secs: parseTimestampToSeconds(ts) }))
             .filter(x => x.secs !== null)
             .sort((a, b) => a.secs - b.secs);
@@ -365,6 +462,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           confidence: bestAutomation.score,
           icon: '🤖',
           detail: `"${bestAutomation.type}" called ${bestAutomation.count} times — mean interval ${bestAutomation.stats.mean.toFixed(1)}s (σ = ${bestAutomation.stats.stdDev.toFixed(2)}s)`,
+          mitre: { id: 'T1071', name: 'Application Layer Protocol', tactic: 'Command and Control' },
           mitigations: ['Rate-limit or block this account/IP', 'Require re-authentication', 'Audit accessed data', 'Check for credential compromise'],
           sparklineData: bestAutomation.sparklineData
         });
@@ -377,6 +475,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           confidence: Math.min(45 + session.eventTypes.size * 4, 80),
           icon: '🔍',
           detail: `Accessed ${session.eventTypes.size} distinct endpoint types across ${session.events.length} requests`,
+          mitre: { id: 'T1595', name: 'Active Scanning', tactic: 'Reconnaissance' },
           mitigations: ['Review authorization per endpoint', 'Enable per-endpoint rate limiting', 'Flag account for manual review']
         });
       }
@@ -394,6 +493,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           confidence: 65,
           icon: '🌙',
           detail: `${afterHours.length} events outside business hours (before 06:00 or after 22:00)`,
+          mitre: { id: 'T1078', name: 'Valid Accounts', tactic: 'Defense Evasion / Persistence' },
           mitigations: ['Verify after-hours access rights', 'Alert security team', 'Review for data exfiltration']
         });
       }
@@ -412,6 +512,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           confidence: hasSuccess ? 90 : 75,
           icon: '🔑',
           detail: `${failedLogins.length} failed login attempt${failedLogins.length > 1 ? 's' : ''}${hasSuccess ? ' followed by successful authentication' : ''}`,
+          mitre: hasSuccess
+            ? { id: 'T1110.004', name: 'Credential Stuffing', tactic: 'Credential Access' }
+            : { id: 'T1110', name: 'Brute Force', tactic: 'Credential Access' },
           mitigations: ['Lock account immediately', 'Force password reset', 'Block source IP', 'Enable MFA']
         });
       }
@@ -445,6 +548,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               confidence: 80,
               icon: '👥',
               detail: `User active simultaneously from ${overlapping.length} IPs: ${overlapping.join(', ')}`,
+              mitre: { id: 'T1563', name: 'Remote Service Session Hijacking', tactic: 'Lateral Movement' },
               mitigations: ['Invalidate all active sessions', 'Force re-authentication', 'Investigate both source IPs', 'Enable geo-velocity checks']
             });
           } else {
@@ -453,6 +557,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               confidence: 55,
               icon: '🔀',
               detail: `Same user accessed from ${distinctIPs.length} different IPs: ${distinctIPs.join(', ')}`,
+              mitre: { id: 'T1078', name: 'Valid Accounts', tactic: 'Defense Evasion' },
               mitigations: ['Verify legitimate device switching', 'Check for shared credential use', 'Review access locations']
             });
           }
@@ -476,6 +581,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               confidence: 70,
               icon: '📡',
               detail: `${distinct.size} distinct endpoint types accessed within a 2-minute window`,
+              mitre: { id: 'T1046', name: 'Network Service Discovery', tactic: 'Discovery' },
               mitigations: ['Enable anomaly-based rate limiting', 'Review all accessed endpoints', 'Audit authorization logs']
             });
             enumerationFlagged = true;
@@ -789,6 +895,19 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     const ipIntel = {};
     Array.from(uniqueIPs).forEach(ip => { ipIntel[ip] = generateIPIntelligence(ip); });
 
+    // Build per-IP profiles for enriched Source IP panel
+    const ipProfiles = {};
+    results.forEach(r => {
+      const ip = r.parameters.sourceIP;
+      if (!ip) return;
+      if (!ipProfiles[ip]) ipProfiles[ip] = { events: 0, users: new Set(), threats: 0, failedLogins: 0, criticalEvents: 0 };
+      ipProfiles[ip].events++;
+      if (r.parameters.user) ipProfiles[ip].users.add(r.parameters.user);
+      if (r.isAlert) ipProfiles[ip].threats++;
+      if (r.threatLevel === 'critical') ipProfiles[ip].criticalEvents++;
+      if (r.categories.includes('Login Attempts') && /\b(fail|denied|invalid|bad.*password)\b/i.test(r.originalLog)) ipProfiles[ip].failedLogins++;
+    });
+
     const threats = detectAdvancedThreats(results);
     let investigation = [];
     try { investigation = runInvestigationEngine(results); } catch (e) { console.error('Investigation engine error:', e); }
@@ -805,7 +924,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     };
 
     const timeline = Object.entries(timelineData).map(([time, count]) => ({ time, count })).sort((a, b) => a.time.localeCompare(b.time));
-    setAnalysis({ results, stats, threats, investigation, timeline, ipIntelligence: ipIntel });
+    setAnalysis({ results, stats, threats, investigation, timeline, ipIntelligence: ipIntel, ipProfiles });
   };
 
   const getThreatLevelColor = (level) => {
@@ -833,9 +952,19 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
 
   const getTopIPs = () => {
     if (!analysis) return [];
-    const ipCounts = {};
-    analysis.results.forEach(r => { const ip = r.parameters.sourceIP; if (ip) ipCounts[ip] = (ipCounts[ip] || 0) + 1; });
-    return Object.entries(ipCounts).sort(([,a], [,b]) => b - a).slice(0, 5).map(([ip, count]) => ({ ip, count }));
+    const profiles = analysis.ipProfiles || {};
+    return Object.entries(profiles)
+      .sort(([, a], [, b]) => b.events - a.events)
+      .slice(0, 8)
+      .map(([ip, p]) => ({
+        ip,
+        count: p.events,
+        users: p.users.size,
+        threats: p.threats,
+        failedLogins: p.failedLogins,
+        critical: p.criticalEvents,
+        intel: analysis.ipIntelligence?.[ip]
+      }));
   };
 
   const filteredResults = analysis?.results.filter(result => {
@@ -1237,14 +1366,32 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                         : darkMode ? 'bg-yellow-900/25 border border-yellow-500/40' : 'bg-yellow-50 border border-yellow-200'
                                   }`}>
                                     <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-                                      <div className="flex items-center gap-2">
+                                      <div className="flex items-center gap-2 flex-wrap">
                                         <span className="text-xl">{finding.icon}</span>
                                         <span className={`font-bold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
+                                        {finding.mitre && (
+                                          <a
+                                            href={`https://attack.mitre.org/techniques/${finding.mitre.id.replace('.', '/')}/`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="text-xs font-mono px-2 py-0.5 rounded border border-purple-500/50 text-purple-400 bg-purple-900/20 hover:bg-purple-800/30 transition-colors"
+                                            title={`MITRE ATT&CK: ${finding.mitre.name} (${finding.mitre.tactic})`}
+                                          >
+                                            {finding.mitre.id}
+                                          </a>
+                                        )}
                                       </div>
-                                      <span className={`text-xs font-bold px-2 py-1 rounded ${
-                                        finding.confidence >= 90 ? 'bg-red-500 text-white' :
-                                        finding.confidence >= 70 ? 'bg-orange-500 text-white' : 'bg-yellow-500 text-black'
-                                      }`}>{finding.confidence}% confidence</span>
+                                      <div className="flex items-center gap-2">
+                                        {finding.mitre && (
+                                          <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'text-purple-300 bg-purple-900/20' : 'text-purple-700 bg-purple-50'}`}>
+                                            {finding.mitre.tactic}
+                                          </span>
+                                        )}
+                                        <span className={`text-xs font-bold px-2 py-1 rounded ${
+                                          finding.confidence >= 90 ? 'bg-red-500 text-white' :
+                                          finding.confidence >= 70 ? 'bg-orange-500 text-white' : 'bg-yellow-500 text-black'
+                                        }`}>{finding.confidence}% confidence</span>
+                                      </div>
                                     </div>
                                     <p className={`text-sm mb-3 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
 
@@ -1341,30 +1488,50 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                     Top Source IPs
                   </h3>
                   <div className="space-y-2">
-                    {getTopIPs().map((item, i) => (
-                      <div key={i} className={`flex justify-between items-center ${darkMode ? 'bg-white/5' : 'bg-gray-50'} rounded p-3`}>
-                        <div>
-                          <div className={`font-semibold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{item.ip}</div>
-                          {analysis.ipIntelligence[item.ip] && (
-                            <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
-                              {analysis.ipIntelligence[item.ip].country} • {analysis.ipIntelligence[item.ip].city}
+                    {getTopIPs().map((item, i) => {
+                      const riskColor = item.intel?.risk === 'High' ? 'text-red-400' : item.intel?.risk === 'Medium' ? 'text-yellow-400' : 'text-green-400';
+                      const rowBg = item.critical > 0 ? (darkMode ? 'bg-red-900/20 border border-red-500/20' : 'bg-red-50 border border-red-200') : (darkMode ? 'bg-white/5' : 'bg-gray-50');
+                      return (
+                        <div key={i} className={`${rowBg} rounded p-3`}>
+                          <div className="flex justify-between items-start">
+                            <div>
+                              <div className={`font-mono font-semibold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{item.ip}</div>
+                              {item.intel && (
+                                <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                                  {item.intel.country} · {item.intel.city} · {item.intel.isp}
+                                </div>
+                              )}
                             </div>
-                          )}
-                        </div>
-                        <div className="text-right">
-                          <div className="text-lg font-bold text-blue-400">{item.count}</div>
-                          {analysis.ipIntelligence[item.ip] && (
-                            <div className={`text-xs font-semibold ${
-                              analysis.ipIntelligence[item.ip].risk === 'High' ? 'text-red-400' : 
-                              analysis.ipIntelligence[item.ip].risk === 'Medium' ? 'text-yellow-400' : 
-                              'text-green-400'
-                            }`}>
-                              {analysis.ipIntelligence[item.ip].risk} Risk
+                            <div className="text-right shrink-0 ml-3">
+                              <div className="text-base font-bold text-blue-400">{item.count} events</div>
+                              {item.intel && <div className={`text-xs font-semibold ${riskColor}`}>{item.intel.risk} Risk</div>}
                             </div>
-                          )}
+                          </div>
+                          <div className="flex gap-3 mt-2 flex-wrap">
+                            {item.users > 0 && (
+                              <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-blue-900/40 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
+                                👤 {item.users} user{item.users !== 1 ? 's' : ''}
+                              </span>
+                            )}
+                            {item.threats > 0 && (
+                              <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-orange-900/40 text-orange-300' : 'bg-orange-100 text-orange-700'}`}>
+                                ⚠️ {item.threats} alert{item.threats !== 1 ? 's' : ''}
+                              </span>
+                            )}
+                            {item.failedLogins > 0 && (
+                              <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-red-900/40 text-red-300' : 'bg-red-100 text-red-700'}`}>
+                                🔑 {item.failedLogins} failed login{item.failedLogins !== 1 ? 's' : ''}
+                              </span>
+                            )}
+                            {item.critical > 0 && (
+                              <span className="text-xs px-2 py-0.5 rounded bg-red-600 text-white font-semibold">
+                                🚨 {item.critical} critical
+                              </span>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               </div>
