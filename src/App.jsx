@@ -13,7 +13,10 @@ const LogAnalyzer = () => {
   const [expandedEvent, setExpandedEvent] = useState(null);
   const [showCharts, setShowCharts] = useState(true);
   const [showInvestigation, setShowInvestigation] = useState(true);
+  const [collapsedSessions, setCollapsedSessions] = useState(new Set());
   const [darkMode, setDarkMode] = useState(true);
+  const [inputMode, setInputMode] = useState('upload');
+  const [logText, setLogText] = useState('');
   const fileInputRef = useRef(null);
 
   const sampleLogs = {
@@ -346,7 +349,14 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         let score = cv < 0.03 ? 95 : cv < 0.10 ? 80 : cv < 0.20 ? 65 : cv < 0.35 ? 45 : 0;
         if (score === 0) return;
         if (evts.length >= 10) score = Math.min(score + 4, 99);
-        if (!bestAutomation || score > bestAutomation.score) bestAutomation = { type, count: evts.length, stats, score };
+        if (!bestAutomation || score > bestAutomation.score) {
+          const sortedTs = timestamps
+            .map(ts => ({ ts, secs: parseTimestampToSeconds(ts) }))
+            .filter(x => x.secs !== null)
+            .sort((a, b) => a.secs - b.secs);
+          const sparklineData = sortedTs.slice(1).map((x, i) => ({ idx: i + 1, interval: x.secs - sortedTs[i].secs }));
+          bestAutomation = { type, count: evts.length, stats, score, sparklineData };
+        }
       });
 
       if (bestAutomation) {
@@ -355,7 +365,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           confidence: bestAutomation.score,
           icon: '🤖',
           detail: `"${bestAutomation.type}" called ${bestAutomation.count} times — mean interval ${bestAutomation.stats.mean.toFixed(1)}s (σ = ${bestAutomation.stats.stdDev.toFixed(2)}s)`,
-          mitigations: ['Rate-limit or block this account/IP', 'Require re-authentication', 'Audit accessed data', 'Check for credential compromise']
+          mitigations: ['Rate-limit or block this account/IP', 'Require re-authentication', 'Audit accessed data', 'Check for credential compromise'],
+          sparklineData: bestAutomation.sparklineData
         });
       }
 
@@ -405,6 +416,73 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         });
       }
 
+      // Rule 5: Session hijacking — same user active from multiple IPs with overlapping time windows
+      if (session.identifierType === 'user') {
+        const ipTimestamps = {};
+        session.events.forEach(e => {
+          const ip = e.parameters.sourceIP;
+          if (!ip) return;
+          const s = parseTimestampToSeconds(e.parameters.timestamp || '');
+          if (s === null) return;
+          if (!ipTimestamps[ip]) ipTimestamps[ip] = [];
+          ipTimestamps[ip].push(s);
+        });
+        const distinctIPs = Object.keys(ipTimestamps);
+        if (distinctIPs.length >= 2) {
+          const ranges = distinctIPs.map(ip => ({ ip, min: Math.min(...ipTimestamps[ip]), max: Math.max(...ipTimestamps[ip]) }));
+          const overlapping = [];
+          for (let i = 0; i < ranges.length; i++) {
+            for (let j = i + 1; j < ranges.length; j++) {
+              if (ranges[i].min <= ranges[j].max && ranges[j].min <= ranges[i].max) {
+                if (!overlapping.includes(ranges[i].ip)) overlapping.push(ranges[i].ip);
+                if (!overlapping.includes(ranges[j].ip)) overlapping.push(ranges[j].ip);
+              }
+            }
+          }
+          if (overlapping.length >= 2) {
+            sessionFindings.push({
+              type: 'Possible Session Hijacking',
+              confidence: 80,
+              icon: '👥',
+              detail: `User active simultaneously from ${overlapping.length} IPs: ${overlapping.join(', ')}`,
+              mitigations: ['Invalidate all active sessions', 'Force re-authentication', 'Investigate both source IPs', 'Enable geo-velocity checks']
+            });
+          } else {
+            sessionFindings.push({
+              type: 'Multi-IP Access',
+              confidence: 55,
+              icon: '🔀',
+              detail: `Same user accessed from ${distinctIPs.length} different IPs: ${distinctIPs.join(', ')}`,
+              mitigations: ['Verify legitimate device switching', 'Check for shared credential use', 'Review access locations']
+            });
+          }
+        }
+      }
+
+      // Rule 6: Endpoint enumeration — many distinct endpoint types hit in a short burst window
+      if (session.events.length >= 5) {
+        const sortedByTime = session.events
+          .map(e => ({ type: e.eventType, ts: parseTimestampToSeconds(e.parameters.timestamp || '') }))
+          .filter(e => e.ts !== null)
+          .sort((a, b) => a.ts - b.ts);
+        let enumerationFlagged = false;
+        for (let i = 0; i < sortedByTime.length && !enumerationFlagged; i++) {
+          const windowEnd = sortedByTime[i].ts + 120;
+          const inWindow = sortedByTime.filter(e => e.ts >= sortedByTime[i].ts && e.ts <= windowEnd);
+          const distinct = new Set(inWindow.map(e => e.type));
+          if (distinct.size >= 4 && inWindow.length >= 6) {
+            sessionFindings.push({
+              type: 'Endpoint Enumeration',
+              confidence: 70,
+              icon: '📡',
+              detail: `${distinct.size} distinct endpoint types accessed within a 2-minute window`,
+              mitigations: ['Enable anomaly-based rate limiting', 'Review all accessed endpoints', 'Audit authorization logs']
+            });
+            enumerationFlagged = true;
+          }
+        }
+      }
+
       if (sessionFindings.length > 0) {
         findings.push({
           identifier: session.identifier,
@@ -419,6 +497,123 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     });
 
     return findings.sort((a, b) => b.riskScore - a.riskScore);
+  };
+
+  const analyzeFromPaste = () => {
+    if (!logText.trim()) return;
+    setLoading(true);
+    setTimeout(() => { analyzeLogFile(logText.trim(), 'pasted_log.txt'); setLoading(false); }, 300);
+  };
+
+  const generateReport = () => {
+    if (!analysis) return;
+    const timestamp = new Date().toLocaleString();
+    const filename = analysis.stats.fileName || 'Unknown';
+    const threatRows = analysis.threats.map((t, i) => `
+      <div class="card ${t.severity}">
+        <div class="card-header">
+          <span class="card-num">[${i + 1}]</span>
+          <span class="card-title">${t.type}</span>
+          <span class="badge ${t.severity}">${t.severity.toUpperCase()}</span>
+        </div>
+        <p class="desc">${t.description}</p>
+        <p class="rec-label">Recommendation:</p>
+        <p class="desc">${t.recommendation}</p>
+        ${t.mitigation ? `<div class="chips">${t.mitigation.map(m => `<span class="chip">${m}</span>`).join('')}</div>` : ''}
+      </div>`).join('');
+    const investigationRows = (analysis.investigation || []).map((session, i) => `
+      <div class="card ${session.riskScore >= 90 ? 'critical' : session.riskScore >= 70 ? 'high' : 'medium'}">
+        <div class="card-header">
+          <span class="card-num">[${i + 1}]</span>
+          <span class="card-title">${session.identifierType === 'user' ? 'User' : 'IP'}: ${session.identifier}</span>
+          <span class="risk-badge">${session.riskScore}/100 Risk</span>
+        </div>
+        <p class="meta">${session.totalEvents} events · ${session.uniqueEventTypes} endpoint types</p>
+        <p class="seq-label">Behavior Sequence:</p>
+        <div class="seq">${session.behaviorSequence.map(s => `${s.type}${s.count > 1 ? ` ×${s.count}` : ''}`).join(' → ')}</div>
+        ${session.findings.map(f => `
+          <div class="sub-card">
+            <div class="sub-header">
+              <span>${f.icon} ${f.type}</span>
+              <span class="conf">${f.confidence}% confidence</span>
+            </div>
+            <p class="desc">${f.detail}</p>
+            <div class="chips">${f.mitigations.map(m => `<span class="chip">${m}</span>`).join('')}</div>
+          </div>`).join('')}
+      </div>`).join('');
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CyberNyx Report</title><style>
+      *{margin:0;padding:0;box-sizing:border-box}
+      body{font-family:'Segoe UI',Arial,sans-serif;color:#1a1a2e;background:#fff;padding:40px;max-width:960px;margin:0 auto}
+      @media print{body{padding:20px}.no-print{display:none}@page{margin:20mm}}
+      .report-header{border-bottom:3px solid #3b82f6;padding-bottom:20px;margin-bottom:32px}
+      .logo{background:linear-gradient(135deg,#3b82f6,#06b6d4);color:white;padding:5px 14px;border-radius:8px;font-size:13px;font-weight:800;margin-right:12px}
+      .report-title{font-size:26px;font-weight:800;color:#1e3a5f;display:flex;align-items:center;margin-bottom:8px}
+      .report-meta{color:#64748b;font-size:13px}
+      .section{margin-bottom:32px}
+      .section-title{font-size:14px;font-weight:700;color:#1e3a5f;border-left:4px solid #3b82f6;padding-left:10px;margin-bottom:16px;text-transform:uppercase;letter-spacing:.06em}
+      .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+      .stat-box{border-radius:8px;padding:14px;text-align:center}
+      .stat-box.critical{background:#fef2f2;border:1px solid #fca5a5}.stat-box.high{background:#fff7ed;border:1px solid #fed7aa}
+      .stat-box.medium{background:#fefce8;border:1px solid #fde68a}.stat-box.low{background:#f0fdf4;border:1px solid #86efac}
+      .stat-num{font-size:30px;font-weight:800}
+      .stat-box.critical .stat-num{color:#dc2626}.stat-box.high .stat-num{color:#ea580c}
+      .stat-box.medium .stat-num{color:#ca8a04}.stat-box.low .stat-num{color:#16a34a}
+      .stat-label{font-size:11px;color:#64748b;font-weight:600;margin-top:4px;text-transform:uppercase}
+      .summary-row{display:flex;gap:24px;flex-wrap:wrap;color:#334155;font-size:14px}
+      .summary-row strong{color:#1e3a5f}
+      .card{border-radius:8px;padding:16px;margin-bottom:12px;border-left:4px solid}
+      .card.critical{background:#fef2f2;border-color:#dc2626}.card.high{background:#fff7ed;border-color:#ea580c}
+      .card.medium{background:#fefce8;border-color:#ca8a04}.card.low{background:#f0fdf4;border-color:#16a34a}
+      .card-header{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+      .card-num{color:#64748b;font-size:12px;font-weight:700}
+      .card-title{font-weight:700;font-size:15px;color:#1e3a5f;flex:1}
+      .badge{padding:2px 10px;border-radius:99px;font-size:11px;font-weight:700}
+      .badge.critical{background:#dc2626;color:white}.badge.high{background:#ea580c;color:white}
+      .badge.medium{background:#ca8a04;color:white}.badge.low{background:#16a34a;color:white}
+      .risk-badge{font-weight:800;color:#dc2626;font-size:14px}
+      .desc{color:#475569;font-size:13px;margin-bottom:8px;line-height:1.5}
+      .rec-label{font-size:11px;font-weight:700;color:#3b82f6;margin-bottom:3px;text-transform:uppercase}
+      .meta{font-size:12px;color:#64748b;margin-bottom:8px}
+      .seq-label{font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+      .seq{font-family:monospace;font-size:12px;color:#1e3a5f;background:#f1f5f9;padding:8px 12px;border-radius:6px;margin-bottom:12px;word-break:break-word;line-height:1.6}
+      .sub-card{background:white;border-radius:6px;padding:12px;margin-top:10px;border:1px solid #e2e8f0}
+      .sub-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px}
+      .sub-header span:first-child{font-weight:700;font-size:13px;color:#1e3a5f}
+      .conf{font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;background:#dc2626;color:white}
+      .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+      .chip{font-size:11px;padding:3px 10px;border-radius:99px;background:#dbeafe;color:#1d4ed8;font-weight:600}
+      .footer{margin-top:40px;padding-top:16px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:11px;text-align:center}
+      .print-btn{position:fixed;top:20px;right:20px;background:#3b82f6;color:white;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;box-shadow:0 4px 12px rgba(59,130,246,.4)}
+      .print-btn:hover{background:#2563eb}
+      .clean-bill{background:#f0fdf4;border:2px solid #86efac;border-radius:8px;padding:20px;text-align:center;color:#16a34a}
+    </style></head><body>
+      <button class="print-btn no-print" onclick="window.print()">Save as PDF</button>
+      <div class="report-header">
+        <div class="report-title"><span class="logo">CyberNyx</span>Security Investigation Report</div>
+        <div class="report-meta">Generated: ${timestamp} &nbsp;·&nbsp; Source: ${filename} &nbsp;·&nbsp; CyberNyx Log Analyzer</div>
+      </div>
+      <div class="section">
+        <div class="section-title">Executive Summary</div>
+        <div class="stats-grid">
+          <div class="stat-box critical"><div class="stat-num">${analysis.stats.critical}</div><div class="stat-label">Critical</div></div>
+          <div class="stat-box high"><div class="stat-num">${analysis.stats.high}</div><div class="stat-label">High Risk</div></div>
+          <div class="stat-box medium"><div class="stat-num">${analysis.stats.medium}</div><div class="stat-label">Medium Risk</div></div>
+          <div class="stat-box low"><div class="stat-num">${analysis.stats.low}</div><div class="stat-label">Low Risk</div></div>
+        </div>
+        <div class="summary-row">
+          <span><strong>${analysis.stats.total}</strong> events analyzed</span>
+          <span><strong>${analysis.stats.uniqueIPs}</strong> unique IPs</span>
+          <span><strong>${analysis.threats.length}</strong> active threat${analysis.threats.length !== 1 ? 's' : ''}</span>
+          <span><strong>${(analysis.investigation || []).length}</strong> suspicious session${(analysis.investigation || []).length !== 1 ? 's' : ''}</span>
+        </div>
+      </div>
+      ${analysis.threats.length > 0 ? `<div class="section"><div class="section-title">Active Threats (${analysis.threats.length})</div>${threatRows}</div>` : ''}
+      ${(analysis.investigation || []).length > 0 ? `<div class="section"><div class="section-title">Behavioral Investigation (${(analysis.investigation || []).length} Suspicious Sessions)</div>${investigationRows}</div>` : ''}
+      ${analysis.threats.length === 0 && (analysis.investigation || []).length === 0 ? `<div class="section"><div class="clean-bill"><strong>No significant threats detected.</strong> Logs appear within normal parameters.</div></div>` : ''}
+      <div class="footer">CyberNyx Log Analyzer · ${timestamp} · Auto-generated — review with a qualified security analyst.</div>
+    </body></html>`;
+    const w = window.open('', '_blank');
+    if (w) { w.document.write(html); w.document.close(); }
   };
 
   const handleFileUpload = async (event) => {
@@ -643,24 +838,53 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         </div>
 
         <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} backdrop-blur-lg rounded-lg p-8 mb-6 border`}>
-          <div className="flex items-center gap-2 mb-4">
-            <Upload className="w-5 h-5 text-blue-400" />
-            <h2 className={`text-xl font-semibold ${darkMode ? '' : 'text-gray-900'}`}>Upload Log File</h2>
-          </div>
-          
-          <label className={`flex flex-col items-center justify-center w-full h-48 border-2 border-dashed ${darkMode ? 'border-white/30 hover:border-blue-400' : 'border-gray-300 hover:border-blue-500'} rounded-lg cursor-pointer hover:bg-opacity-5 transition-all`}>
-            <div className="flex flex-col items-center justify-center pt-5 pb-6">
-              <FileText className="w-12 h-12 text-blue-400 mb-3" />
-              <p className={`mb-2 text-sm ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
-                <span className="font-semibold">Click to upload</span> or drag and drop
-              </p>
-              <p className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-                {uploadedFile ? `Selected: ${uploadedFile.name}` : 'Any log file (TXT, LOG, etc.)'}
-              </p>
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Upload className="w-5 h-5 text-blue-400" />
+              <h2 className={`text-xl font-semibold ${darkMode ? '' : 'text-gray-900'}`}>Analyze Logs</h2>
             </div>
-            <input ref={fileInputRef} type="file" className="hidden" accept=".txt,.log,.csv" onChange={handleFileUpload} />
-          </label>
-          
+            <div className={`flex gap-1 p-1 rounded-lg ${darkMode ? 'bg-white/10' : 'bg-gray-100'}`}>
+              <button onClick={() => setInputMode('upload')} className={`px-4 py-1.5 rounded text-sm font-medium transition-all ${inputMode === 'upload' ? 'bg-blue-500 text-white shadow' : darkMode ? 'text-gray-400 hover:text-white' : 'text-gray-600 hover:text-gray-900'}`}>
+                Upload File
+              </button>
+              <button onClick={() => setInputMode('paste')} className={`px-4 py-1.5 rounded text-sm font-medium transition-all ${inputMode === 'paste' ? 'bg-blue-500 text-white shadow' : darkMode ? 'text-gray-400 hover:text-white' : 'text-gray-600 hover:text-gray-900'}`}>
+                Paste Logs
+              </button>
+            </div>
+          </div>
+
+          {inputMode === 'upload' ? (
+            <label className={`flex flex-col items-center justify-center w-full h-48 border-2 border-dashed ${darkMode ? 'border-white/30 hover:border-blue-400' : 'border-gray-300 hover:border-blue-500'} rounded-lg cursor-pointer hover:bg-opacity-5 transition-all`}>
+              <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                <FileText className="w-12 h-12 text-blue-400 mb-3" />
+                <p className={`mb-2 text-sm ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                  <span className="font-semibold">Click to upload</span> or drag and drop
+                </p>
+                <p className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                  {uploadedFile ? `Selected: ${uploadedFile.name}` : 'Any log file (TXT, LOG, etc.)'}
+                </p>
+              </div>
+              <input ref={fileInputRef} type="file" className="hidden" accept=".txt,.log,.csv" onChange={handleFileUpload} />
+            </label>
+          ) : (
+            <div className="space-y-3">
+              <textarea
+                value={logText}
+                onChange={e => setLogText(e.target.value)}
+                placeholder={`Paste log content here...\n\nExample:\n2024-03-15 09:00:05 INFO user=alice GET /dashboard - Dashboard\n2024-03-15 09:00:35 INFO user=alice GET /api/data - API Request\n2024-03-15 09:01:05 INFO user=alice GET /api/data - API Request`}
+                className={`w-full h-48 p-4 rounded-lg border font-mono text-xs resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 ${darkMode ? 'bg-black/30 border-white/20 text-gray-300 placeholder-gray-600' : 'bg-gray-50 border-gray-300 text-gray-900 placeholder-gray-400'}`}
+              />
+              <button
+                onClick={analyzeFromPaste}
+                disabled={!logText.trim() || loading}
+                className="w-full py-3 bg-blue-500 hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2"
+              >
+                <Activity className="w-4 h-4" />
+                Analyze Logs
+              </button>
+            </div>
+          )}
+
           {loading && (
             <div className={`mt-4 text-center ${darkMode ? 'text-blue-400' : 'text-blue-600'}`}>
               <Activity className="w-6 h-6 animate-spin inline-block mr-2" />
@@ -816,81 +1040,121 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
 
                 {showInvestigation && (
                   <div className="space-y-4">
-                    {analysis.investigation.map((session, idx) => (
-                      <div key={idx} className={`${darkMode ? 'bg-slate-900/70' : 'bg-white'} rounded-lg p-5 border-l-4 ${
-                        session.riskScore >= 90 ? 'border-red-500' : session.riskScore >= 70 ? 'border-orange-500' : 'border-yellow-500'
-                      }`}>
-
-                        <div className="flex items-start justify-between mb-4">
-                          <div>
-                            <div className="flex items-center gap-3 mb-1 flex-wrap">
-                              <span className={`text-xs font-semibold px-2 py-1 rounded ${darkMode ? 'bg-blue-500/20 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
-                                {session.identifierType === 'user' ? '👤 User' : '🌐 IP'}
-                              </span>
-                              <span className={`font-mono font-bold text-lg ${darkMode ? 'text-white' : 'text-gray-900'}`}>{session.identifier}</span>
-                            </div>
-                            <div className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
-                              {session.totalEvents} total events · {session.uniqueEventTypes} endpoint type{session.uniqueEventTypes !== 1 ? 's' : ''}
-                            </div>
-                          </div>
-                          <div className="text-right flex-shrink-0 ml-4">
-                            <div className={`text-4xl font-bold ${session.riskScore >= 90 ? 'text-red-400' : session.riskScore >= 70 ? 'text-orange-400' : 'text-yellow-400'}`}>
-                              {session.riskScore}<span className={`text-sm font-normal ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>/100</span>
-                            </div>
-                            <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>Risk Score</div>
-                          </div>
-                        </div>
-
-                        {session.behaviorSequence.length > 0 && (
-                          <div className="mb-4">
-                            <div className={`text-xs font-semibold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-2`}>BEHAVIOR SEQUENCE</div>
-                            <div className="flex items-center gap-2 flex-wrap">
-                              {session.behaviorSequence.map((step, i) => (
-                                <React.Fragment key={i}>
-                                  {i > 0 && <span className={`${darkMode ? 'text-gray-500' : 'text-gray-400'} text-sm`}>→</span>}
-                                  <span className={`px-2 py-1 rounded text-xs font-medium ${
-                                    step.count > 3
-                                      ? darkMode ? 'bg-red-900/40 text-red-300 border border-red-500/50' : 'bg-red-100 text-red-700 border border-red-300'
-                                      : darkMode ? 'bg-white/10 text-gray-300' : 'bg-gray-100 text-gray-700'
-                                  }`}>
-                                    {step.type}{step.count > 1 ? ` ×${step.count}` : ''}
-                                  </span>
-                                </React.Fragment>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-
-                        <div className="space-y-3">
-                          {session.findings.map((finding, fi) => (
-                            <div key={fi} className={`rounded-lg p-4 ${
-                              finding.confidence >= 90
-                                ? darkMode ? 'bg-red-900/25 border border-red-500/40' : 'bg-red-50 border border-red-200'
-                                : finding.confidence >= 70
-                                  ? darkMode ? 'bg-orange-900/25 border border-orange-500/40' : 'bg-orange-50 border border-orange-200'
-                                  : darkMode ? 'bg-yellow-900/25 border border-yellow-500/40' : 'bg-yellow-50 border border-yellow-200'
-                            }`}>
-                              <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-                                <div className="flex items-center gap-2">
-                                  <span className="text-xl">{finding.icon}</span>
-                                  <span className={`font-bold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
-                                </div>
-                                <span className={`text-xs font-bold px-2 py-1 rounded ${
-                                  finding.confidence >= 90 ? 'bg-red-500 text-white' :
-                                  finding.confidence >= 70 ? 'bg-orange-500 text-white' : 'bg-yellow-500 text-black'
-                                }`}>{finding.confidence}% confidence</span>
+                    {analysis.investigation.map((session, idx) => {
+                      const isCollapsed = collapsedSessions.has(idx);
+                      const toggleSession = () => {
+                        const next = new Set(collapsedSessions);
+                        next.has(idx) ? next.delete(idx) : next.add(idx);
+                        setCollapsedSessions(next);
+                      };
+                      return (
+                        <div key={idx} className={`${darkMode ? 'bg-slate-900/70' : 'bg-white'} rounded-lg border-l-4 overflow-hidden ${
+                          session.riskScore >= 90 ? 'border-red-500' : session.riskScore >= 70 ? 'border-orange-500' : 'border-yellow-500'
+                        }`}>
+                          {/* Session card header — always visible, click to collapse */}
+                          <button onClick={toggleSession} className="w-full p-5 text-left">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-3 flex-wrap">
+                                <span className={`text-xs font-semibold px-2 py-1 rounded ${darkMode ? 'bg-blue-500/20 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
+                                  {session.identifierType === 'user' ? '👤 User' : '🌐 IP'}
+                                </span>
+                                <span className={`font-mono font-bold text-lg ${darkMode ? 'text-white' : 'text-gray-900'}`}>{session.identifier}</span>
+                                <span className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+                                  {session.totalEvents} events · {session.findings.length} finding{session.findings.length !== 1 ? 's' : ''}
+                                </span>
                               </div>
-                              <p className={`text-sm mb-3 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
-                              <div className="flex flex-wrap gap-2">
-                                {finding.mitigations.map((m, mi) => (
-                                  <span key={mi} className={`text-xs px-2 py-1 rounded ${darkMode ? 'bg-blue-900/30 text-blue-300 border border-blue-500/30' : 'bg-blue-50 text-blue-700 border border-blue-200'}`}>{m}</span>
+                              <div className="flex items-center gap-3 flex-shrink-0">
+                                <div className="text-right">
+                                  <div className={`text-2xl font-bold ${session.riskScore >= 90 ? 'text-red-400' : session.riskScore >= 70 ? 'text-orange-400' : 'text-yellow-400'}`}>
+                                    {session.riskScore}<span className={`text-xs font-normal ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>/100</span>
+                                  </div>
+                                </div>
+                                {isCollapsed ? <ChevronDown className="w-4 h-4 text-gray-400" /> : <ChevronUp className="w-4 h-4 text-gray-400" />}
+                              </div>
+                            </div>
+                          </button>
+
+                          {/* Collapsible body */}
+                          {!isCollapsed && (
+                            <div className="px-5 pb-5">
+                              {/* Behavior Sequence */}
+                              {session.behaviorSequence.length > 0 && (
+                                <div className="mb-4">
+                                  <div className={`text-xs font-semibold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-2`}>BEHAVIOR SEQUENCE</div>
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    {session.behaviorSequence.map((step, i) => (
+                                      <React.Fragment key={i}>
+                                        {i > 0 && <span className={`${darkMode ? 'text-gray-500' : 'text-gray-400'} text-sm`}>→</span>}
+                                        <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                          step.count > 3
+                                            ? darkMode ? 'bg-red-900/40 text-red-300 border border-red-500/50' : 'bg-red-100 text-red-700 border border-red-300'
+                                            : darkMode ? 'bg-white/10 text-gray-300' : 'bg-gray-100 text-gray-700'
+                                        }`}>
+                                          {step.type}{step.count > 1 ? ` ×${step.count}` : ''}
+                                        </span>
+                                      </React.Fragment>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Findings */}
+                              <div className="space-y-3">
+                                {session.findings.map((finding, fi) => (
+                                  <div key={fi} className={`rounded-lg p-4 ${
+                                    finding.confidence >= 90
+                                      ? darkMode ? 'bg-red-900/25 border border-red-500/40' : 'bg-red-50 border border-red-200'
+                                      : finding.confidence >= 70
+                                        ? darkMode ? 'bg-orange-900/25 border border-orange-500/40' : 'bg-orange-50 border border-orange-200'
+                                        : darkMode ? 'bg-yellow-900/25 border border-yellow-500/40' : 'bg-yellow-50 border border-yellow-200'
+                                  }`}>
+                                    <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+                                      <div className="flex items-center gap-2">
+                                        <span className="text-xl">{finding.icon}</span>
+                                        <span className={`font-bold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
+                                      </div>
+                                      <span className={`text-xs font-bold px-2 py-1 rounded ${
+                                        finding.confidence >= 90 ? 'bg-red-500 text-white' :
+                                        finding.confidence >= 70 ? 'bg-orange-500 text-white' : 'bg-yellow-500 text-black'
+                                      }`}>{finding.confidence}% confidence</span>
+                                    </div>
+                                    <p className={`text-sm mb-3 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
+
+                                    {/* Interval sparkline for automation findings */}
+                                    {finding.sparklineData && finding.sparklineData.length > 1 && (
+                                      <div className="mb-3">
+                                        <div className={`text-xs font-semibold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-1`}>REQUEST INTERVAL PATTERN</div>
+                                        <div className={`rounded p-2 ${darkMode ? 'bg-black/30' : 'bg-white'}`}>
+                                          <ResponsiveContainer width="100%" height={60}>
+                                            <LineChart data={finding.sparklineData} margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
+                                              <Line type="monotone" dataKey="interval" stroke={finding.confidence >= 90 ? '#ef4444' : '#f97316'} strokeWidth={2} dot={{ r: 3, fill: finding.confidence >= 90 ? '#ef4444' : '#f97316' }} />
+                                              <Tooltip
+                                                contentStyle={{ backgroundColor: darkMode ? '#1e293b' : '#fff', border: '1px solid #3b82f6', borderRadius: '6px', fontSize: '11px' }}
+                                                formatter={(v) => [`${v}s`, 'Interval']}
+                                                labelFormatter={(l) => `Request #${l}`}
+                                              />
+                                            </LineChart>
+                                          </ResponsiveContainer>
+                                          <div className={`text-center text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+                                            Flat = automation · Spiky = human
+                                          </div>
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    <div className="flex flex-wrap gap-2">
+                                      {finding.mitigations.map((m, mi) => (
+                                        <span key={mi} className={`text-xs px-2 py-1 rounded ${darkMode ? 'bg-blue-900/30 text-blue-300 border border-blue-500/30' : 'bg-blue-50 text-blue-700 border border-blue-200'}`}>{m}</span>
+                                      ))}
+                                    </div>
+                                  </div>
                                 ))}
                               </div>
                             </div>
-                          ))}
+                          )}
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1054,6 +1318,10 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                   <button onClick={() => exportResults('json')} className="flex items-center gap-2 bg-blue-500/20 hover:bg-blue-500/30 border border-blue-500/50 rounded px-3 py-2 text-sm transition-all">
                     <Download className="w-4 h-4" />
                     JSON
+                  </button>
+                  <button onClick={generateReport} className="flex items-center gap-2 bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 text-red-400 rounded px-3 py-2 text-sm font-semibold transition-all">
+                    <FileText className="w-4 h-4" />
+                    PDF Report
                   </button>
                 </div>
               </div>
