@@ -513,6 +513,18 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     if (!analysis) return;
     const timestamp = new Date().toLocaleString();
     const filename = analysis.stats.fileName || 'Unknown';
+
+    // Top 10 source IPs
+    const ipCounts = {};
+    analysis.results.forEach(r => { const ip = r.parameters.sourceIP; if (ip) ipCounts[ip] = (ipCounts[ip] || 0) + 1; });
+    const topIPs = Object.entries(ipCounts).sort(([,a],[,b]) => b - a).slice(0, 10);
+
+    // Category breakdown (sorted by count)
+    const catEntries = Object.entries(analysis.stats.categoryBreakdown).sort(([,a],[,b]) => b - a);
+
+    // Alert breakdown by severity
+    const severityPct = (n) => analysis.stats.total > 0 ? ((n / analysis.stats.total) * 100).toFixed(1) : '0.0';
+
     const threatRows = analysis.threats.map((t, i) => `
       <div class="card ${t.severity}">
         <div class="card-header">
@@ -525,14 +537,15 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         <p class="desc">${t.recommendation}</p>
         ${t.mitigation ? `<div class="chips">${t.mitigation.map(m => `<span class="chip">${m}</span>`).join('')}</div>` : ''}
       </div>`).join('');
+
     const investigationRows = (analysis.investigation || []).map((session, i) => `
       <div class="card ${session.riskScore >= 90 ? 'critical' : session.riskScore >= 70 ? 'high' : 'medium'}">
         <div class="card-header">
           <span class="card-num">[${i + 1}]</span>
-          <span class="card-title">${session.identifierType === 'user' ? 'User' : 'IP'}: ${session.identifier}</span>
+          <span class="card-title">${session.identifierType === 'user' ? '👤 User' : '🌐 IP'}: ${session.identifier}</span>
           <span class="risk-badge">${session.riskScore}/100 Risk</span>
         </div>
-        <p class="meta">${session.totalEvents} events · ${session.uniqueEventTypes} endpoint types</p>
+        <p class="meta">${session.totalEvents} total events · ${session.uniqueEventTypes} endpoint type${session.uniqueEventTypes !== 1 ? 's' : ''}</p>
         <p class="seq-label">Behavior Sequence:</p>
         <div class="seq">${session.behaviorSequence.map(s => `${s.type}${s.count > 1 ? ` ×${s.count}` : ''}`).join(' → ')}</div>
         ${session.findings.map(f => `
@@ -545,57 +558,110 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
             <div class="chips">${f.mitigations.map(m => `<span class="chip">${m}</span>`).join('')}</div>
           </div>`).join('')}
       </div>`).join('');
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CyberNyx Report</title><style>
+
+    const topIPRows = topIPs.map(([ip, count], i) => {
+      const intel = analysis.ipIntelligence[ip];
+      const riskColor = intel?.risk === 'High' ? '#dc2626' : intel?.risk === 'Medium' ? '#ea580c' : '#16a34a';
+      return `<tr>
+        <td>${i + 1}</td>
+        <td style="font-family:monospace;font-weight:600">${ip}</td>
+        <td>${intel ? `${intel.country}, ${intel.city}` : '—'}</td>
+        <td>${intel?.isp || '—'}</td>
+        <td style="font-weight:700;color:${riskColor}">${intel?.risk || '—'}</td>
+        <td style="font-weight:700;color:#1e3a5f">${count}</td>
+      </tr>`;
+    }).join('');
+
+    const catRows = catEntries.slice(0, 12).map(([cat, count]) => {
+      const pct = analysis.stats.total > 0 ? ((count / analysis.stats.total) * 100).toFixed(1) : '0';
+      const barW = Math.round((count / (catEntries[0]?.[1] || 1)) * 100);
+      return `<tr>
+        <td>${cat}</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="flex:1;height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden">
+              <div style="width:${barW}%;height:100%;background:#3b82f6;border-radius:4px"></div>
+            </div>
+            <span style="font-weight:700;color:#1e3a5f;min-width:36px;text-align:right">${count}</span>
+          </div>
+        </td>
+        <td style="color:#64748b">${pct}%</td>
+      </tr>`;
+    }).join('');
+
+    const overallRisk = analysis.stats.critical > 0 ? 'CRITICAL' : analysis.stats.high > 10 ? 'HIGH' : analysis.stats.high > 0 ? 'MEDIUM-HIGH' : analysis.stats.medium > 0 ? 'MEDIUM' : 'LOW';
+    const riskColor = overallRisk === 'CRITICAL' ? '#dc2626' : overallRisk.startsWith('HIGH') || overallRisk === 'MEDIUM-HIGH' ? '#ea580c' : overallRisk === 'MEDIUM' ? '#ca8a04' : '#16a34a';
+
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CyberNyx Security Report — ${filename}</title><style>
       *{margin:0;padding:0;box-sizing:border-box}
-      body{font-family:'Segoe UI',Arial,sans-serif;color:#1a1a2e;background:#fff;padding:40px;max-width:960px;margin:0 auto}
-      @media print{body{padding:20px}.no-print{display:none}@page{margin:20mm}}
+      body{font-family:'Segoe UI',Arial,sans-serif;color:#1a1a2e;background:#fff;padding:40px;max-width:980px;margin:0 auto;line-height:1.5}
+      @media print{body{padding:20px}.no-print{display:none}@page{margin:18mm;size:A4}}
       .report-header{border-bottom:3px solid #3b82f6;padding-bottom:20px;margin-bottom:32px}
-      .logo{background:linear-gradient(135deg,#3b82f6,#06b6d4);color:white;padding:5px 14px;border-radius:8px;font-size:13px;font-weight:800;margin-right:12px}
+      .logo{background:linear-gradient(135deg,#3b82f6,#06b6d4);color:white;padding:5px 14px;border-radius:8px;font-size:13px;font-weight:800;margin-right:12px;letter-spacing:.02em}
       .report-title{font-size:26px;font-weight:800;color:#1e3a5f;display:flex;align-items:center;margin-bottom:8px}
-      .report-meta{color:#64748b;font-size:13px}
-      .section{margin-bottom:32px}
-      .section-title{font-size:14px;font-weight:700;color:#1e3a5f;border-left:4px solid #3b82f6;padding-left:10px;margin-bottom:16px;text-transform:uppercase;letter-spacing:.06em}
+      .report-meta{color:#64748b;font-size:13px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+      .dot{color:#cbd5e1}
+      .overall-risk{display:inline-block;padding:3px 12px;border-radius:99px;font-size:12px;font-weight:800;background:${riskColor};color:white;margin-left:4px}
+      .section{margin-bottom:36px}
+      .section-title{font-size:13px;font-weight:700;color:#1e3a5f;border-left:4px solid #3b82f6;padding-left:10px;margin-bottom:16px;text-transform:uppercase;letter-spacing:.07em}
       .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
-      .stat-box{border-radius:8px;padding:14px;text-align:center}
+      .stat-box{border-radius:10px;padding:16px;text-align:center}
       .stat-box.critical{background:#fef2f2;border:1px solid #fca5a5}.stat-box.high{background:#fff7ed;border:1px solid #fed7aa}
       .stat-box.medium{background:#fefce8;border:1px solid #fde68a}.stat-box.low{background:#f0fdf4;border:1px solid #86efac}
-      .stat-num{font-size:30px;font-weight:800}
+      .stat-num{font-size:34px;font-weight:800;line-height:1}
       .stat-box.critical .stat-num{color:#dc2626}.stat-box.high .stat-num{color:#ea580c}
       .stat-box.medium .stat-num{color:#ca8a04}.stat-box.low .stat-num{color:#16a34a}
-      .stat-label{font-size:11px;color:#64748b;font-weight:600;margin-top:4px;text-transform:uppercase}
-      .summary-row{display:flex;gap:24px;flex-wrap:wrap;color:#334155;font-size:14px}
+      .stat-label{font-size:10px;color:#64748b;font-weight:700;margin-top:5px;text-transform:uppercase;letter-spacing:.05em}
+      .summary-row{display:flex;gap:20px;flex-wrap:wrap;color:#334155;font-size:13px;padding:12px 16px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0}
       .summary-row strong{color:#1e3a5f}
+      .two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+      table{width:100%;border-collapse:collapse;font-size:13px}
+      th{text-align:left;padding:8px 10px;background:#f1f5f9;color:#475569;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid #e2e8f0}
+      td{padding:8px 10px;border-bottom:1px solid #f1f5f9;color:#334155;vertical-align:middle}
+      tr:last-child td{border-bottom:none}
       .card{border-radius:8px;padding:16px;margin-bottom:12px;border-left:4px solid}
       .card.critical{background:#fef2f2;border-color:#dc2626}.card.high{background:#fff7ed;border-color:#ea580c}
       .card.medium{background:#fefce8;border-color:#ca8a04}.card.low{background:#f0fdf4;border-color:#16a34a}
       .card-header{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
-      .card-num{color:#64748b;font-size:12px;font-weight:700}
+      .card-num{color:#94a3b8;font-size:11px;font-weight:700}
       .card-title{font-weight:700;font-size:15px;color:#1e3a5f;flex:1}
       .badge{padding:2px 10px;border-radius:99px;font-size:11px;font-weight:700}
       .badge.critical{background:#dc2626;color:white}.badge.high{background:#ea580c;color:white}
       .badge.medium{background:#ca8a04;color:white}.badge.low{background:#16a34a;color:white}
-      .risk-badge{font-weight:800;color:#dc2626;font-size:14px}
-      .desc{color:#475569;font-size:13px;margin-bottom:8px;line-height:1.5}
-      .rec-label{font-size:11px;font-weight:700;color:#3b82f6;margin-bottom:3px;text-transform:uppercase}
-      .meta{font-size:12px;color:#64748b;margin-bottom:8px}
-      .seq-label{font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
-      .seq{font-family:monospace;font-size:12px;color:#1e3a5f;background:#f1f5f9;padding:8px 12px;border-radius:6px;margin-bottom:12px;word-break:break-word;line-height:1.6}
+      .risk-badge{font-weight:800;color:#dc2626;font-size:15px}
+      .desc{color:#475569;font-size:13px;margin-bottom:8px;line-height:1.6}
+      .rec-label{font-size:10px;font-weight:700;color:#3b82f6;margin-bottom:3px;text-transform:uppercase;letter-spacing:.04em}
+      .meta{font-size:12px;color:#64748b;margin-bottom:10px}
+      .seq-label{font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+      .seq{font-family:'Consolas',monospace;font-size:12px;color:#1e3a5f;background:#f1f5f9;padding:10px 14px;border-radius:6px;margin-bottom:12px;word-break:break-word;line-height:1.7}
       .sub-card{background:white;border-radius:6px;padding:12px;margin-top:10px;border:1px solid #e2e8f0}
       .sub-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px}
       .sub-header span:first-child{font-weight:700;font-size:13px;color:#1e3a5f}
       .conf{font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;background:#dc2626;color:white}
       .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
       .chip{font-size:11px;padding:3px 10px;border-radius:99px;background:#dbeafe;color:#1d4ed8;font-weight:600}
-      .footer{margin-top:40px;padding-top:16px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:11px;text-align:center}
-      .print-btn{position:fixed;top:20px;right:20px;background:#3b82f6;color:white;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;box-shadow:0 4px 12px rgba(59,130,246,.4)}
+      .clean-card{background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:16px;color:#15803d;font-weight:600;display:flex;align-items:center;gap:8px}
+      .recs{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+      .rec-item{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:12px;font-size:13px;color:#334155}
+      .rec-item strong{display:block;color:#1e3a5f;margin-bottom:3px;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+      .footer{margin-top:48px;padding-top:16px;border-top:2px solid #e2e8f0;color:#94a3b8;font-size:11px;display:flex;justify-content:space-between;align-items:center}
+      .footer .brand{color:#3b82f6;font-weight:700}
+      .print-btn{position:fixed;top:20px;right:20px;background:#3b82f6;color:white;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;box-shadow:0 4px 14px rgba(59,130,246,.35);display:flex;align-items:center;gap:6px}
       .print-btn:hover{background:#2563eb}
-      .clean-bill{background:#f0fdf4;border:2px solid #86efac;border-radius:8px;padding:20px;text-align:center;color:#16a34a}
     </style></head><body>
-      <button class="print-btn no-print" onclick="window.print()">Save as PDF</button>
+      <button class="print-btn no-print" onclick="window.print()">&#x1F4BE; Save as PDF</button>
+
       <div class="report-header">
         <div class="report-title"><span class="logo">CyberNyx</span>Security Investigation Report</div>
-        <div class="report-meta">Generated: ${timestamp} &nbsp;·&nbsp; Source: ${filename} &nbsp;·&nbsp; CyberNyx Log Analyzer</div>
+        <div class="report-meta">
+          <span>Generated: <strong>${timestamp}</strong></span>
+          <span class="dot">·</span>
+          <span>Source: <strong>${filename}</strong></span>
+          <span class="dot">·</span>
+          <span>Overall Risk: <span class="overall-risk">${overallRisk}</span></span>
+        </div>
       </div>
+
       <div class="section">
         <div class="section-title">Executive Summary</div>
         <div class="stats-grid">
@@ -605,16 +671,68 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           <div class="stat-box low"><div class="stat-num">${analysis.stats.low}</div><div class="stat-label">Low Risk</div></div>
         </div>
         <div class="summary-row">
-          <span><strong>${analysis.stats.total}</strong> events analyzed</span>
+          <span><strong>${analysis.stats.total.toLocaleString()}</strong> total events</span>
+          <span><strong>${analysis.stats.alerts}</strong> alerts (${severityPct(analysis.stats.alerts)}%)</span>
           <span><strong>${analysis.stats.uniqueIPs}</strong> unique IPs</span>
+          <span><strong>${Object.keys(analysis.stats.categoryBreakdown).length}</strong> event categories</span>
           <span><strong>${analysis.threats.length}</strong> active threat${analysis.threats.length !== 1 ? 's' : ''}</span>
           <span><strong>${(analysis.investigation || []).length}</strong> suspicious session${(analysis.investigation || []).length !== 1 ? 's' : ''}</span>
         </div>
       </div>
-      ${analysis.threats.length > 0 ? `<div class="section"><div class="section-title">Active Threats (${analysis.threats.length})</div>${threatRows}</div>` : ''}
-      ${(analysis.investigation || []).length > 0 ? `<div class="section"><div class="section-title">Behavioral Investigation (${(analysis.investigation || []).length} Suspicious Sessions)</div>${investigationRows}</div>` : ''}
-      ${analysis.threats.length === 0 && (analysis.investigation || []).length === 0 ? `<div class="section"><div class="clean-bill"><strong>No significant threats detected.</strong> Logs appear within normal parameters.</div></div>` : ''}
-      <div class="footer">CyberNyx Log Analyzer · ${timestamp} · Auto-generated — review with a qualified security analyst.</div>
+
+      ${analysis.threats.length > 0 ? `
+      <div class="section">
+        <div class="section-title">Active Threats Detected (${analysis.threats.length})</div>
+        ${threatRows}
+      </div>` : `
+      <div class="section">
+        <div class="clean-card">✅ No active threats detected in this log file.</div>
+      </div>`}
+
+      ${(analysis.investigation || []).length > 0 ? `
+      <div class="section">
+        <div class="section-title">Behavioral Investigation — ${(analysis.investigation || []).length} Suspicious Session${(analysis.investigation || []).length !== 1 ? 's' : ''}</div>
+        ${investigationRows}
+      </div>` : `
+      <div class="section">
+        <div class="section-title">Behavioral Investigation</div>
+        <div class="clean-card">✅ No suspicious behavioral patterns detected. Sessions appear within normal parameters.</div>
+      </div>`}
+
+      <div class="section">
+        <div class="section-title">Event Category Breakdown</div>
+        <table>
+          <thead><tr><th>Category</th><th>Distribution</th><th>% of Total</th></tr></thead>
+          <tbody>${catRows}</tbody>
+        </table>
+      </div>
+
+      ${topIPs.length > 0 ? `
+      <div class="section">
+        <div class="section-title">Top Source IPs by Activity</div>
+        <table>
+          <thead><tr><th>#</th><th>IP Address</th><th>Location</th><th>ISP / Network</th><th>Risk</th><th>Events</th></tr></thead>
+          <tbody>${topIPRows}</tbody>
+        </table>
+      </div>` : ''}
+
+      <div class="section">
+        <div class="section-title">General Security Recommendations</div>
+        <div class="recs">
+          <div class="rec-item"><strong>Log Retention</strong>Ensure logs are retained for at least 90 days and backed up to a tamper-proof store for forensic use.</div>
+          <div class="rec-item"><strong>Alert Tuning</strong>${analysis.stats.critical > 0 ? `${analysis.stats.critical} critical events require immediate triage. Review and escalate as appropriate.` : 'No critical events found. Continue routine monitoring and review alert thresholds.'}</div>
+          <div class="rec-item"><strong>IP Monitoring</strong>${topIPs.length > 0 ? `Top activity from ${topIPs[0]?.[0]} (${topIPs[0]?.[1]} events). ${analysis.ipIntelligence[topIPs[0]?.[0]]?.risk === 'High' ? 'This IP is flagged HIGH risk — review immediately.' : 'Review activity patterns for anomalies.'}` : 'No significant IP activity patterns found.'}</div>
+          <div class="rec-item"><strong>Authentication</strong>${analysis.threats.some(t => /brute|credential|login/i.test(t.type)) ? 'Brute force activity detected. Enforce account lockout, MFA, and rate limiting on auth endpoints.' : 'No authentication attacks detected. Maintain strong password policies and MFA.'}</div>
+          <div class="rec-item"><strong>Network Security</strong>${analysis.threats.some(t => /port scan|ddos/i.test(t.type)) ? 'Port scan or DDoS activity found. Review firewall rules, enable IDS/IPS, and consider geo-blocking.' : 'No network-level attacks detected. Keep firewall rules and IDS signatures updated.'}</div>
+          <div class="rec-item"><strong>Next Review</strong>Schedule follow-up analysis within 24 hours if any critical threats are present, otherwise within 7 days.</div>
+        </div>
+      </div>
+
+      <div class="footer">
+        <span><span class="brand">CyberNyx</span> Log Analyzer — Auto-generated report</span>
+        <span>${timestamp}</span>
+        <span>Review with a qualified security analyst before acting on findings.</span>
+      </div>
     </body></html>`;
     const w = window.open('', '_blank');
     if (w) { w.document.write(html); w.document.close(); }
