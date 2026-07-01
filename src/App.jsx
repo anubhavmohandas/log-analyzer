@@ -659,6 +659,13 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           caseSummary = `${entity} exhibited ${sessionFindings.length} behavioral anomal${sessionFindings.length > 1 ? 'ies' : 'y'} across ${session.events.length} events. Manual review is recommended.`;
         }
 
+        // Include chronological events for the investigation timeline (cap at 60)
+        const sortedEvents = [...session.events].sort((a, b) => {
+          const sa = parseTimestampToSeconds(a.parameters.timestamp || '');
+          const sb = parseTimestampToSeconds(b.parameters.timestamp || '');
+          return (sa ?? 0) - (sb ?? 0);
+        });
+
         findings.push({
           identifier: session.identifier,
           identifierType: session.identifierType,
@@ -668,6 +675,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           riskScore: maxConf,
           tier,
           caseSummary,
+          sessionEvents: sortedEvents.slice(0, 60),
           findings: sessionFindings
         });
       }
@@ -1187,7 +1195,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       
       categories.forEach(cat => { categoryStats[cat] = (categoryStats[cat] || 0) + 1; });
       const timeKey = parameters.timestamp?.split(' ')[0] || parameters.timestamp?.split(':')[0] || 'Unknown';
-      timelineData[timeKey] = (timelineData[timeKey] || 0) + 1;
+      if (!timelineData[timeKey]) timelineData[timeKey] = { count: 0, threats: 0 };
+      timelineData[timeKey].count++;
+      if (threatLevel === 'critical' || threatLevel === 'high') timelineData[timeKey].threats++;
       
       results.push({ lineNumber: index + 1, originalLog: line, categories, eventType, parameters, threatLevel, isAlert: threatLevel === 'critical' || threatLevel === 'high' });
     });
@@ -1223,7 +1233,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       fileName
     };
 
-    const timeline = Object.entries(timelineData).map(([time, count]) => ({ time, count })).sort((a, b) => a.time.localeCompare(b.time));
+    const timeline = Object.entries(timelineData).map(([time, d]) => ({ time, count: d.count, threats: d.threats })).sort((a, b) => a.time.localeCompare(b.time));
     setAnalysis({ results, stats, threats, investigation, timeline, ipIntelligence: ipIntel, ipProfiles });
   };
 
@@ -1253,6 +1263,19 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
   const getTopIPs = () => {
     if (!analysis) return [];
     const profiles = analysis.ipProfiles || {};
+    // Build IP → investigation session map
+    const ipInvMap = {};
+    (analysis.investigation || []).forEach(s => {
+      if (s.identifierType === 'ip') {
+        if (!ipInvMap[s.identifier] || s.riskScore > (ipInvMap[s.identifier].riskScore || 0)) {
+          ipInvMap[s.identifier] = s;
+        }
+      }
+      (s.sessionEvents || []).forEach(e => {
+        const ip = e.parameters?.sourceIP;
+        if (ip && !ipInvMap[ip]) ipInvMap[ip] = s;
+      });
+    });
     return Object.entries(profiles)
       .sort(([, a], [, b]) => b.events - a.events)
       .slice(0, 8)
@@ -1263,7 +1286,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         threats: p.threats,
         failedLogins: p.failedLogins,
         critical: p.criticalEvents,
-        intel: analysis.ipIntelligence?.[ip]
+        intel: analysis.ipIntelligence?.[ip],
+        investigation: ipInvMap[ip] || null
       }));
   };
 
@@ -1500,47 +1524,58 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         {analysis && (
           <>
             {/* Statistics Dashboard */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-              <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} rounded-lg p-6 border border-red-500/50`}>
-                <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <div className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>Critical</div>
-                    <div className="text-3xl font-bold text-red-400">{analysis.stats.critical}</div>
+            {(() => {
+              const inv = analysis.investigation || [];
+              const affectedUsers = new Set(inv.filter(s => s.identifierType === 'user').map(s => s.identifier)).size;
+              const allMitre = new Set();
+              inv.forEach(s => s.findings.forEach(f => { if (f.mitre) allMitre.add(f.mitre.id); }));
+              const criticalSessions = inv.filter(s => s.tier === 'critical').length;
+              return (
+                <>
+                  {/* Investigation-focused metrics */}
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
+                    <div className={`${darkMode ? 'bg-white/10 border-red-500/40' : 'bg-white border-red-300 shadow'} rounded-lg p-4 border`}>
+                      <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${darkMode ? 'text-red-400' : 'text-red-600'}`}>Confirmed Threats</div>
+                      <div className="text-3xl font-bold text-red-400">{analysis.threats.length}</div>
+                      <div className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{analysis.stats.critical} critical events</div>
+                    </div>
+                    <div className={`${darkMode ? 'bg-white/10 border-orange-500/40' : 'bg-white border-orange-300 shadow'} rounded-lg p-4 border`}>
+                      <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${darkMode ? 'text-orange-400' : 'text-orange-600'}`}>Suspicious Sessions</div>
+                      <div className="text-3xl font-bold text-orange-400">{inv.length}</div>
+                      <div className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{criticalSessions} critical tier</div>
+                    </div>
+                    <div className={`${darkMode ? 'bg-white/10 border-blue-500/40' : 'bg-white border-blue-300 shadow'} rounded-lg p-4 border`}>
+                      <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${darkMode ? 'text-blue-400' : 'text-blue-600'}`}>Affected Users</div>
+                      <div className="text-3xl font-bold text-blue-400">{affectedUsers}</div>
+                      <div className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{analysis.stats.uniqueIPs} unique IPs</div>
+                    </div>
+                    <div className={`${darkMode ? 'bg-white/10 border-purple-500/40' : 'bg-white border-purple-300 shadow'} rounded-lg p-4 border`}>
+                      <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${darkMode ? 'text-purple-400' : 'text-purple-600'}`}>Unique MITRE</div>
+                      <div className="text-3xl font-bold text-purple-400">{allMitre.size}</div>
+                      <div className={`text-xs mt-1 font-mono truncate ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{[...allMitre].slice(0, 3).join(' · ') || '—'}</div>
+                    </div>
                   </div>
-                  <AlertTriangle className="w-10 h-10 text-red-400 opacity-50" />
-                </div>
-              </div>
-              
-              <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} rounded-lg p-6 border border-orange-500/50`}>
-                <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <div className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>High Risk</div>
-                    <div className="text-3xl font-bold text-orange-400">{analysis.stats.high}</div>
+                  {/* Severity strip */}
+                  <div className={`${darkMode ? 'bg-white/10 border-white/10' : 'bg-white border-gray-200 shadow'} rounded-lg px-5 py-3 border mb-6 flex items-center gap-6 flex-wrap`}>
+                    {[['Critical', analysis.stats.critical, 'text-red-400'], ['High', analysis.stats.high, 'text-orange-400'], ['Medium', analysis.stats.medium, 'text-yellow-400'], ['Low', analysis.stats.low, 'text-green-400']].map(([label, val, cls]) => (
+                      <div key={label} className="flex items-center gap-2">
+                        <span className={`text-2xl font-bold tabular-nums ${cls}`}>{val.toLocaleString()}</span>
+                        <span className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{label}</span>
+                      </div>
+                    ))}
+                    <div className="flex-1 min-w-32">
+                      <div className="flex gap-0.5 h-2 rounded overflow-hidden">
+                        {analysis.stats.critical > 0 && <div style={{ flex: analysis.stats.critical }} className="bg-red-500" />}
+                        {analysis.stats.high > 0 && <div style={{ flex: analysis.stats.high }} className="bg-orange-400" />}
+                        {analysis.stats.medium > 0 && <div style={{ flex: analysis.stats.medium }} className="bg-yellow-400" />}
+                        {analysis.stats.low > 0 && <div style={{ flex: analysis.stats.low }} className="bg-green-400" />}
+                      </div>
+                    </div>
+                    <span className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{analysis.stats.total.toLocaleString()} total events</span>
                   </div>
-                  <AlertTriangle className="w-10 h-10 text-orange-400 opacity-50" />
-                </div>
-              </div>
-              
-              <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} rounded-lg p-6 border border-yellow-500/50`}>
-                <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <div className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>Medium Risk</div>
-                    <div className="text-3xl font-bold text-yellow-400">{analysis.stats.medium}</div>
-                  </div>
-                  <Activity className="w-10 h-10 text-yellow-400 opacity-50" />
-                </div>
-              </div>
-              
-              <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} rounded-lg p-6 border border-green-500/50`}>
-                <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <div className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>Low Risk</div>
-                    <div className="text-3xl font-bold text-green-400">{analysis.stats.low}</div>
-                  </div>
-                  <Shield className="w-10 h-10 text-green-400 opacity-50" />
-                </div>
-              </div>
-            </div>
+                </>
+              );
+            })()}
 
             {/* Threat Intelligence Section */}
             {analysis.threats.length > 0 && (
@@ -1594,6 +1629,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               const visibleSessions = showAllSessions ? inv : inv.slice(0, SESSION_PREVIEW);
               const hiddenCount = inv.length - SESSION_PREVIEW;
 
+              // Score → color helper
+              const scoreColor = (s) => s >= 90 ? 'text-red-400' : s >= 80 ? 'text-orange-400' : s >= 65 ? 'text-yellow-400' : s >= 50 ? 'text-blue-400' : 'text-gray-400';
+              const scoreBg = (s) => s >= 90 ? 'bg-red-500' : s >= 80 ? 'bg-orange-500' : s >= 65 ? 'bg-yellow-500 text-black' : s >= 50 ? 'bg-blue-500' : 'bg-gray-500';
+              const sevDot = { critical: 'bg-red-500', high: 'bg-orange-400', medium: 'bg-yellow-400', low: 'bg-green-400' };
+
               const SessionCard = ({ session, idx }) => {
                 const isExpanded = expandedSessions.has(idx);
                 const toggleSession = () => {
@@ -1602,29 +1642,35 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                   setExpandedSessions(next);
                 };
                 const topFinding = session.findings[0];
-                const borderColor = session.tier === 'critical' ? 'border-red-500' : session.tier === 'review' ? 'border-orange-400' : 'border-yellow-400';
-                const scoreColor = session.riskScore >= 88 ? 'text-red-400' : session.riskScore >= 65 ? 'text-orange-400' : 'text-yellow-400';
+                const borderColor = session.tier === 'critical' ? 'border-red-500' : session.tier === 'review' ? 'border-orange-400' : 'border-yellow-400/60';
 
                 return (
-                  <div key={idx} className={`${darkMode ? 'bg-slate-900/70' : 'bg-white'} rounded-lg border-l-4 overflow-hidden shadow-sm ${borderColor}`}>
-                    {/* Collapsed header — always visible */}
+                  <div className={`${darkMode ? 'bg-slate-900/70' : 'bg-white'} rounded-lg border-l-4 overflow-hidden shadow-sm ${borderColor}`}>
+                    {/* Collapsed header */}
                     <button onClick={toggleSession} className="w-full p-4 text-left hover:bg-white/5 transition-colors">
                       <div className="flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-3 flex-wrap min-w-0">
-                          <span className={`text-xs font-semibold px-2 py-0.5 rounded shrink-0 ${darkMode ? 'bg-blue-500/20 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
-                            {session.identifierType === 'user' ? '👤 User' : '🌐 IP'}
-                          </span>
-                          <span className={`font-mono font-bold truncate ${darkMode ? 'text-white' : 'text-gray-900'}`}>{session.identifier}</span>
-                          {topFinding && (
-                            <span className={`text-xs truncate ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-                              {topFinding.icon} {topFinding.type}
-                              {topFinding.mitre && <span className={`ml-2 font-mono ${darkMode ? 'text-purple-400' : 'text-purple-600'}`}>{topFinding.mitre.id}</span>}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap mb-1">
+                            <span className={`text-xs font-semibold px-2 py-0.5 rounded shrink-0 ${darkMode ? 'bg-blue-500/20 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
+                              {session.identifierType === 'user' ? '👤 User' : '🌐 IP'}
                             </span>
+                            <span className={`font-mono font-bold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{session.identifier}</span>
+                            {topFinding?.mitre && (
+                              <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-50 text-purple-600'}`}>
+                                {topFinding.mitre.id}
+                              </span>
+                            )}
+                            <span className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{session.totalEvents} events</span>
+                          </div>
+                          {/* One-line preview */}
+                          {topFinding && (
+                            <div className={`text-xs truncate ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                              {topFinding.icon} {topFinding.type} — {topFinding.detail}
+                            </div>
                           )}
-                          <span className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{session.totalEvents} events</span>
                         </div>
-                        <div className="flex items-center gap-3 shrink-0">
-                          <div className={`text-xl font-bold tabular-nums ${scoreColor}`}>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <div className={`text-xl font-bold tabular-nums ${scoreColor(session.riskScore)}`}>
                             {session.riskScore}<span className={`text-xs font-normal ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>/100</span>
                           </div>
                           {isExpanded ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
@@ -1632,14 +1678,69 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                       </div>
                     </button>
 
-                    {/* Expanded body */}
-                    {isExpanded && (
+                    {/* Animated expand */}
+                    <div className={`transition-all duration-300 ease-in-out overflow-hidden ${isExpanded ? 'max-h-[3000px] opacity-100' : 'max-h-0 opacity-0'}`}>
                       <div className="px-5 pb-5 border-t border-white/10">
+
                         {/* Case Summary */}
-                        <div className={`mt-4 mb-5 p-4 rounded-lg ${darkMode ? 'bg-blue-950/40 border border-blue-500/20' : 'bg-blue-50 border border-blue-200'}`}>
+                        <div className={`mt-4 mb-4 p-4 rounded-lg ${darkMode ? 'bg-blue-950/40 border border-blue-500/20' : 'bg-blue-50 border border-blue-200'}`}>
                           <div className={`text-xs font-bold tracking-widest mb-2 ${darkMode ? 'text-blue-400' : 'text-blue-600'}`}>ANALYST CASE SUMMARY</div>
                           <p className={`text-sm leading-relaxed ${darkMode ? 'text-gray-200' : 'text-gray-700'}`}>{session.caseSummary}</p>
                         </div>
+
+                        {/* Investigation Timeline */}
+                        {session.sessionEvents && session.sessionEvents.length > 0 && (
+                          <div className="mb-5">
+                            <div className={`text-xs font-bold tracking-widest mb-3 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>INVESTIGATION TIMELINE</div>
+                            <div className="relative">
+                              {/* Vertical line */}
+                              <div className={`absolute left-[15px] top-0 bottom-0 w-px ${darkMode ? 'bg-white/10' : 'bg-gray-200'}`} />
+                              <div className="space-y-1">
+                                {session.sessionEvents.map((ev, ei) => {
+                                  const isRepeated = ei > 0 && session.sessionEvents[ei - 1].eventType === ev.eventType;
+                                  // Group repeated events: show first 2, then summarize
+                                  if (isRepeated) {
+                                    const sameTypeAhead = session.sessionEvents.slice(ei).filter(e => e.eventType === ev.eventType);
+                                    // Show ellipsis only once when 3+ consecutive same events
+                                    const prevCount = session.sessionEvents.slice(0, ei).filter(e => e.eventType === ev.eventType).length;
+                                    if (prevCount === 2) {
+                                      const remaining = session.sessionEvents.slice(ei).filter(e => e.eventType === ev.eventType).length;
+                                      return (
+                                        <div key={ei} className="flex items-center gap-3 pl-8">
+                                          <span className={`text-xs italic ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>
+                                            ···  {remaining} more "{ev.eventType}" events
+                                          </span>
+                                        </div>
+                                      );
+                                    }
+                                    if (prevCount > 2) return null;
+                                  }
+                                  return (
+                                    <div key={ei} className="flex items-start gap-3">
+                                      <div className={`w-[31px] shrink-0 flex justify-center pt-1.5`}>
+                                        <div className={`w-2 h-2 rounded-full shrink-0 ${sevDot[ev.threatLevel] || 'bg-gray-400'}`} />
+                                      </div>
+                                      <div className={`flex-1 rounded p-2 text-xs ${darkMode ? 'bg-white/5 hover:bg-white/8' : 'bg-gray-50 hover:bg-gray-100'} transition-colors`}>
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                          {ev.parameters.timestamp && <span className={`font-mono ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{ev.parameters.timestamp}</span>}
+                                          <span className={`font-semibold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{ev.eventType}</span>
+                                          {ev.parameters.user && <span className={`${darkMode ? 'text-blue-400' : 'text-blue-600'}`}>👤 {ev.parameters.user}</span>}
+                                          {ev.parameters.sourceIP && <span className={`${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{ev.parameters.sourceIP}</span>}
+                                          {ev.parameters.url && <span className={`font-mono truncate max-w-xs ${darkMode ? 'text-cyan-400' : 'text-cyan-700'}`}>{ev.parameters.url}</span>}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                                {session.totalEvents > 60 && (
+                                  <div className={`pl-8 text-xs italic ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>
+                                    + {session.totalEvents - 60} more events not shown
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        )}
 
                         {/* Behavior Sequence */}
                         {session.behaviorSequence.length > 0 && (
@@ -1670,7 +1771,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                 ? darkMode ? 'bg-red-900/25 border border-red-500/30' : 'bg-red-50 border border-red-200'
                                 : finding.confidence >= 65
                                   ? darkMode ? 'bg-orange-900/20 border border-orange-500/30' : 'bg-orange-50 border border-orange-200'
-                                  : darkMode ? 'bg-yellow-900/15 border border-yellow-500/20' : 'bg-yellow-50 border border-yellow-200'
+                                  : finding.confidence >= 50
+                                    ? darkMode ? 'bg-blue-900/15 border border-blue-500/20' : 'bg-blue-50 border border-blue-200'
+                                    : darkMode ? 'bg-white/5 border border-white/10' : 'bg-gray-50 border border-gray-200'
                             }`}>
                               <div className="flex items-start justify-between mb-2 gap-2 flex-wrap">
                                 <div className="flex items-center gap-2 flex-wrap">
@@ -1678,8 +1781,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                   <span className={`font-bold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
                                   {finding.mitre && (
                                     <a href={`https://attack.mitre.org/techniques/${finding.mitre.id.replace('.', '/')}/`} target="_blank" rel="noopener noreferrer"
-                                      className="text-xs font-mono px-2 py-0.5 rounded border border-purple-500/50 text-purple-400 bg-purple-900/20 hover:bg-purple-800/30 transition-colors"
-                                      title={`${finding.mitre.name} · ${finding.mitre.tactic}`}>
+                                      className="text-xs font-mono px-2 py-0.5 rounded border border-purple-500/50 text-purple-400 bg-purple-900/20 hover:bg-purple-800/30 transition-colors">
                                       {finding.mitre.id}
                                     </a>
                                   )}
@@ -1689,21 +1791,14 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                     </span>
                                   )}
                                 </div>
-                                <span className={`text-xs font-bold px-2 py-1 rounded shrink-0 ${
-                                  finding.confidence >= 88 ? 'bg-red-500 text-white' :
-                                  finding.confidence >= 65 ? 'bg-orange-500 text-white' : 'bg-yellow-500 text-black'
-                                }`}>{finding.confidence}%</span>
+                                <span className={`text-xs font-bold px-2 py-1 rounded shrink-0 text-white ${scoreBg(finding.confidence)}`}>{finding.confidence}%</span>
                               </div>
                               <p className={`text-sm mb-3 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
-
-                              {/* Evidence bullets */}
-                              {finding.evidence && finding.evidence.length > 0 && (
+                              {finding.evidence?.length > 0 && (
                                 <ul className={`text-xs mb-3 space-y-1 pl-4 list-disc ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
                                   {finding.evidence.map((e, ei) => <li key={ei}>{e}</li>)}
                                 </ul>
                               )}
-
-                              {/* Sparkline */}
                               {finding.sparklineData && finding.sparklineData.length > 1 && (
                                 <div className="mb-3">
                                   <div className={`text-xs font-semibold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-1`}>REQUEST INTERVAL PATTERN</div>
@@ -1715,11 +1810,10 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                           formatter={(v) => [`${v}s`, 'Interval']} labelFormatter={(l) => `Request #${l}`} />
                                       </LineChart>
                                     </ResponsiveContainer>
-                                    <div className={`text-center text-xs mt-1 ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>Flat line = automation · Spiky = human</div>
+                                    <div className={`text-center text-xs mt-1 ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>Flat = automation · Spiky = human</div>
                                   </div>
                                 </div>
                               )}
-
                               <div className="flex flex-wrap gap-2">
                                 {finding.mitigations.map((m, mi) => (
                                   <span key={mi} className={`text-xs px-2 py-1 rounded ${darkMode ? 'bg-blue-900/30 text-blue-300 border border-blue-500/20' : 'bg-blue-50 text-blue-700 border border-blue-200'}`}>{m}</span>
@@ -1729,7 +1823,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                           ))}
                         </div>
                       </div>
-                    )}
+                    </div>
                   </div>
                 );
               };
@@ -1775,6 +1869,57 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
 
                   {showInvestigation && (
                     <>
+                      {/* Investigation Overview */}
+                      {inv.length > 0 && (() => {
+                        const topSession = inv[0];
+                        const topFinding = topSession.findings[0];
+                        const allMitreInv = [...new Set(inv.flatMap(s => s.findings.map(f => f.mitre?.id).filter(Boolean)))];
+                        const affectedUserIds = [...new Set(inv.filter(s => s.identifierType === 'user').map(s => s.identifier))];
+                        // Time range: min/max timestamp across all session events
+                        const allTs = inv.flatMap(s => (s.sessionEvents || []).map(e => e.parameters.timestamp).filter(Boolean));
+                        const timeRange = allTs.length >= 2 ? `${allTs[0]} – ${allTs[allTs.length - 1]}` : null;
+
+                        return (
+                          <div className={`mb-5 p-4 rounded-lg ${darkMode ? 'bg-slate-900/60 border border-white/10' : 'bg-white border border-gray-200 shadow-sm'}`}>
+                            <div className={`text-xs font-bold tracking-widest mb-3 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>INVESTIGATION OVERVIEW</div>
+                            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+                              <div>
+                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-0.5`}>Attack Type</div>
+                                <div className={`text-sm font-semibold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{topFinding?.type || '—'}</div>
+                              </div>
+                              <div>
+                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-0.5`}>Affected Users</div>
+                                <div className={`text-sm font-semibold ${darkMode ? 'text-white' : 'text-gray-900'}`}>
+                                  {affectedUserIds.length > 0 ? (
+                                    <span title={affectedUserIds.join(', ')}>{affectedUserIds.length} user{affectedUserIds.length !== 1 ? 's' : ''}</span>
+                                  ) : '—'}
+                                </div>
+                              </div>
+                              <div>
+                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-0.5`}>MITRE Techniques</div>
+                                <div className="flex flex-wrap gap-1">
+                                  {allMitreInv.slice(0, 4).map(id => (
+                                    <span key={id} className={`text-xs font-mono px-1.5 py-0.5 rounded ${darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-50 text-purple-600'}`}>{id}</span>
+                                  ))}
+                                  {allMitreInv.length > 4 && <span className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>+{allMitreInv.length - 4}</span>}
+                                  {allMitreInv.length === 0 && <span className={`text-xs ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>—</span>}
+                                </div>
+                              </div>
+                              <div>
+                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-0.5`}>Observed</div>
+                                <div className={`text-xs font-mono ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{timeRange || '—'}</div>
+                              </div>
+                              <div>
+                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-0.5`}>Top Confidence</div>
+                                <div className={`text-lg font-bold ${scoreColor(topSession.riskScore)}`}>
+                                  {topSession.riskScore}<span className={`text-xs font-normal ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>/100</span>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
                       <TierGroup label="🚨 Critical Investigations" color="bg-red-500/20 text-red-400 border border-red-500/30" sessions={visibleCritical} startIdx={0} />
                       <TierGroup label="⚠️ Needs Review" color="bg-orange-500/20 text-orange-400 border border-orange-500/30" sessions={visibleReview} startIdx={visibleCritical.length} />
                       <TierGroup label="ℹ️ Informational" color="bg-blue-500/20 text-blue-400 border border-blue-500/30" sessions={visibleInfo} startIdx={visibleCritical.length + visibleReview.length} />
@@ -1812,20 +1957,13 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                         contentStyle={{ backgroundColor: darkMode ? '#1e293b' : '#ffffff', border: '1px solid #3b82f6', borderRadius: '8px', fontSize: '12px' }}
                         labelStyle={{ color: darkMode ? '#e5e7eb' : '#1e293b', fontWeight: 600 }}
                       />
-                      <Bar dataKey="count" name="Events" fill="#3b82f6" radius={[3, 3, 0, 0]} />
+                      <Bar dataKey="count" name="Total Events" fill={darkMode ? '#334155' : '#cbd5e1'} radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="threats" name="Threats (Critical/High)" fill="#ef4444" radius={[2, 2, 0, 0]} />
                     </BarChart>
                   </ResponsiveContainer>
-                  {/* Severity severity mini-bar */}
-                  <div className="mt-3 flex gap-1 rounded overflow-hidden h-2">
-                    {analysis.stats.critical > 0 && <div style={{ flex: analysis.stats.critical }} className="bg-red-500" title={`Critical: ${analysis.stats.critical}`} />}
-                    {analysis.stats.high > 0 && <div style={{ flex: analysis.stats.high }} className="bg-orange-400" title={`High: ${analysis.stats.high}`} />}
-                    {analysis.stats.medium > 0 && <div style={{ flex: analysis.stats.medium }} className="bg-yellow-400" title={`Medium: ${analysis.stats.medium}`} />}
-                    {analysis.stats.low > 0 && <div style={{ flex: analysis.stats.low }} className="bg-green-400" title={`Low: ${analysis.stats.low}`} />}
-                  </div>
-                  <div className="flex gap-4 mt-2">
-                    {[['Critical', analysis.stats.critical, 'text-red-400'], ['High', analysis.stats.high, 'text-orange-400'], ['Medium', analysis.stats.medium, 'text-yellow-400'], ['Low', analysis.stats.low, 'text-green-400']].map(([label, val, cls]) => (
-                      <span key={label} className={`text-xs ${cls}`}><strong>{val.toLocaleString()}</strong> {label}</span>
-                    ))}
+                  <div className="flex gap-5 mt-2">
+                    <span className="flex items-center gap-1.5 text-xs text-gray-400"><span className="w-3 h-3 rounded-sm inline-block" style={{ background: darkMode ? '#334155' : '#cbd5e1' }} />Total events</span>
+                    <span className="flex items-center gap-1.5 text-xs text-red-400"><span className="w-3 h-3 rounded-sm inline-block bg-red-500" />Threats (Critical + High)</span>
                   </div>
                 </div>
 
@@ -1838,45 +1976,47 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                   <div className="space-y-2">
                     {getTopIPs().map((item, i) => {
                       const riskColor = item.intel?.risk === 'High' ? 'text-red-400' : item.intel?.risk === 'Medium' ? 'text-yellow-400' : 'text-green-400';
-                      const rowBg = item.critical > 0 ? (darkMode ? 'bg-red-900/20 border border-red-500/20' : 'bg-red-50 border border-red-200') : (darkMode ? 'bg-white/5' : 'bg-gray-50');
+                      const inv = item.investigation;
+                      const hasInv = !!inv;
+                      const rowBg = item.critical > 0 || hasInv
+                        ? (darkMode ? 'bg-red-900/15 border border-red-500/20' : 'bg-red-50 border border-red-200')
+                        : (darkMode ? 'bg-white/5 border border-white/5' : 'bg-gray-50 border border-gray-100');
                       return (
-                        <div key={i} className={`${rowBg} rounded p-3`}>
-                          <div className="flex justify-between items-start">
+                        <div key={i} className={`${rowBg} rounded p-3 transition-all`}>
+                          <div className="flex justify-between items-start mb-2">
                             <div>
                               <div className={`font-mono font-semibold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{item.ip}</div>
                               {item.intel && (
-                                <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-                                  {item.intel.country} · {item.intel.city} · {item.intel.isp}
+                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+                                  {item.intel.country} · {item.intel.isp}
                                 </div>
                               )}
                             </div>
                             <div className="text-right shrink-0 ml-3">
-                              <div className="text-base font-bold text-blue-400">{item.count} events</div>
+                              <div className={`text-sm font-bold text-blue-400`}>{item.count.toLocaleString()} events</div>
                               {item.intel && <div className={`text-xs font-semibold ${riskColor}`}>{item.intel.risk} Risk</div>}
                             </div>
                           </div>
-                          <div className="flex gap-3 mt-2 flex-wrap">
-                            {item.users > 0 && (
-                              <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-blue-900/40 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
-                                👤 {item.users} user{item.users !== 1 ? 's' : ''}
-                              </span>
-                            )}
-                            {item.threats > 0 && (
-                              <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-orange-900/40 text-orange-300' : 'bg-orange-100 text-orange-700'}`}>
-                                ⚠️ {item.threats} alert{item.threats !== 1 ? 's' : ''}
-                              </span>
-                            )}
-                            {item.failedLogins > 0 && (
-                              <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-red-900/40 text-red-300' : 'bg-red-100 text-red-700'}`}>
-                                🔑 {item.failedLogins} failed login{item.failedLogins !== 1 ? 's' : ''}
-                              </span>
-                            )}
-                            {item.critical > 0 && (
-                              <span className="text-xs px-2 py-0.5 rounded bg-red-600 text-white font-semibold">
-                                🚨 {item.critical} critical
-                              </span>
-                            )}
+                          <div className="flex gap-2 flex-wrap">
+                            {item.users > 0 && <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-blue-900/40 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>👤 {item.users} user{item.users !== 1 ? 's' : ''}</span>}
+                            {item.threats > 0 && <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-orange-900/40 text-orange-300' : 'bg-orange-100 text-orange-700'}`}>⚠️ {item.threats} alerts</span>}
+                            {item.failedLogins > 0 && <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-red-900/40 text-red-300' : 'bg-red-100 text-red-700'}`}>🔑 {item.failedLogins} failed logins</span>}
+                            {item.critical > 0 && <span className="text-xs px-2 py-0.5 rounded bg-red-600 text-white font-semibold">🚨 {item.critical} critical</span>}
                           </div>
+                          {/* Investigation link — why you care */}
+                          {hasInv && (
+                            <div className={`mt-2 pt-2 border-t ${darkMode ? 'border-white/10' : 'border-gray-200'}`}>
+                              <div className="flex items-center justify-between gap-2">
+                                <span className={`text-xs font-semibold ${darkMode ? 'text-orange-300' : 'text-orange-700'}`}>
+                                  🔎 {inv.findings[0]?.type || 'Suspicious behavior'}
+                                </span>
+                                <span className={`text-xs font-bold tabular-nums ${scoreColor(inv.riskScore)}`}>{inv.riskScore}/100</span>
+                              </div>
+                              {inv.findings[0]?.mitre && (
+                                <span className={`text-xs font-mono ${darkMode ? 'text-purple-400' : 'text-purple-600'}`}>{inv.findings[0].mitre.id} · {inv.findings[0].mitre.tactic}</span>
+                              )}
+                            </div>
+                          )}
                         </div>
                       );
                     })}
