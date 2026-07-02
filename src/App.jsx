@@ -1073,14 +1073,14 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       const riskCls = session.riskScore >= 90 ? 'critical' : session.riskScore >= 70 ? 'high' : 'medium';
       const subCards = session.findings.map(f => {
         const confCls = f.confidence >= 90 ? 'conf-crit' : f.confidence >= 70 ? 'conf-high' : 'conf-med';
-        const mitreBadge = f.mitre ? `<span class="mitre-badge">${esc(f.mitre.id)}</span><span class="tactic-badge">${esc(f.mitre.tactic)}</span>` : '';
         return `<div class="sub-card">
           <div class="sub-header">
-            <span>${f.icon} <strong>${esc(f.type)}</strong> ${mitreBadge}</span>
+            <span>${f.icon} <strong>Detection: ${esc(f.type)}</strong></span>
             <span class="conf ${confCls}">${f.confidence}% confidence</span>
           </div>
           <p class="desc">${esc(f.detail)}</p>
-          ${f.mitre ? `<p class="mitre-line">MITRE ATT&amp;CK · <strong>${esc(f.mitre.id)}</strong> · ${esc(f.mitre.name)} · Tactic: ${esc(f.mitre.tactic)}</p>` : ''}
+          ${f.evidence?.length ? `<p class="desc" style="margin-top:-4px"><strong>Evidence:</strong> ${f.evidence.map(e=>esc(e)).join(' · ')}</p>` : ''}
+          ${f.mitre ? `<p class="mitre-line">Potential ATT&amp;CK (analytical hypothesis, not proof) · <strong>${esc(f.mitre.id)}</strong> · ${esc(f.mitre.name)} · Tactic: ${esc(f.mitre.tactic)}</p>` : ''}
           <div class="chips">${(f.mitigations||[]).map(m=>`<span class="chip">${esc(m)}</span>`).join('')}</div>
         </div>`;
       }).join('');
@@ -1375,7 +1375,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     The behavioral analysis engine identified <strong>${inv.length} suspicious session${inv.length!==1?'s':''}</strong>.
     The highest-risk entity is <strong>${esc(inv[0].identifier)}</strong> (risk score ${inv[0].riskScore}/100),
     flagged for: ${inv[0].findings.map(f=>`<strong>${esc(f.type)}</strong>`).join(', ')}.
-    ${inv[0].findings[0]?.mitre ? `This maps to MITRE ATT&amp;CK technique <strong>${esc(inv[0].findings[0].mitre.id)} — ${esc(inv[0].findings[0].mitre.name)}</strong>.` : ''}
+    ${inv[0].findings[0]?.mitre ? `This behavior is a potential match for MITRE ATT&amp;CK technique <strong>${esc(inv[0].findings[0].mitre.id)} — ${esc(inv[0].findings[0].mitre.name)}</strong> (an analytical hypothesis based on the observed evidence, not confirmed attacker activity).` : ''}
   </div>` : ''}
   ${threats.length > 0 ? `<div class="narrative">
     <strong>${threats.length} confirmed threat${threats.length!==1?'s were':' was'} detected</strong>:
@@ -2084,7 +2084,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                       <div className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{analysis.stats.uniqueIPs} unique IPs</div>
                     </div>
                     <div className={`${darkMode ? 'bg-white/10 border-purple-500/40' : 'bg-white border-purple-300 shadow'} rounded-lg p-4 border`}>
-                      <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${darkMode ? 'text-purple-400' : 'text-purple-600'}`}>Unique MITRE</div>
+                      <div title={MITRE_HYPOTHESIS_NOTE} className={`text-xs font-bold uppercase tracking-wider mb-1 cursor-help flex items-center gap-1 ${darkMode ? 'text-purple-400' : 'text-purple-600'}`}>Potential ATT&CK <span>ⓘ</span></div>
                       <div className="text-3xl font-bold text-purple-400">{allMitre.size}</div>
                       <div className={`text-xs mt-1 font-mono truncate ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{[...allMitre].slice(0, 3).join(' · ') || '—'}</div>
                     </div>
@@ -2189,8 +2189,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                             <span className={`font-mono font-bold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{session.identifier}</span>
                             <span onClick={e => e.stopPropagation()}><CopyButton value={session.identifier} darkMode={darkMode} label={session.identifierType === 'user' ? 'user' : 'IP'} /></span>
                             {topFinding?.mitre && (
-                              <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-50 text-purple-600'}`}>
-                                {topFinding.mitre.id}
+                              <span title={MITRE_HYPOTHESIS_NOTE} className={`text-xs font-mono px-1.5 py-0.5 rounded cursor-help ${darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-50 text-purple-600'}`}>
+                                ~{topFinding.mitre.id}
                               </span>
                             )}
                             <span className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{session.totalEvents} events</span>
@@ -2318,27 +2318,21 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                     ? darkMode ? 'bg-blue-900/15 border border-blue-500/20' : 'bg-blue-50 border border-blue-200'
                                     : darkMode ? 'bg-white/5 border border-white/10' : 'bg-gray-50 border border-gray-200'
                             }`}>
+                              {/* Detection — what the engine objectively observed. Deliberately
+                                  no MITRE badge in this title row: the technique is an inference,
+                                  not the name of what was detected. */}
                               <div className="flex items-start justify-between mb-2 gap-2 flex-wrap">
                                 <div className="flex items-center gap-2 flex-wrap">
-                                  <span className="text-lg">{finding.icon}</span>
-                                  <span className={`font-bold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
-                                  {finding.mitre && (
-                                    <button
-                                      onClick={() => setMitreFilter(f => f === finding.mitre.id ? null : finding.mitre.id)}
-                                      title={`Filter investigation to ${finding.mitre.id} findings`}
-                                      className={`text-xs font-mono px-2 py-0.5 rounded border transition-colors ${mitreFilter === finding.mitre.id ? 'border-purple-400 text-white bg-purple-600' : 'border-purple-500/50 text-purple-400 bg-purple-900/20 hover:bg-purple-800/30'}`}>
-                                      {finding.mitre.id}
-                                    </button>
-                                  )}
-                                  <a href={finding.mitre ? `https://attack.mitre.org/techniques/${finding.mitre.id.replace('.', '/')}/` : undefined} target="_blank" rel="noopener noreferrer"
-                                    className={finding.mitre ? `text-xs px-2 py-0.5 rounded underline decoration-dotted ${darkMode ? 'text-purple-300/70 bg-purple-900/10 hover:text-purple-200' : 'text-purple-600 bg-purple-50 hover:text-purple-800'}` : 'hidden'}>
-                                    {finding.mitre?.tactic}
-                                  </a>
+                                  <span className={`text-[10px] font-bold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>DETECTION</span>
                                 </div>
                                 <span
                                   title={`Why flagged:\n${(finding.evidence || []).join('\n')}`}
                                   className={`text-sm font-bold px-2.5 py-1.5 rounded shrink-0 text-white cursor-help ${scoreBg(finding.confidence)}`}
                                 >{finding.confidence}%</span>
+                              </div>
+                              <div className="flex items-center gap-2 flex-wrap mb-2">
+                                <span className="text-lg">{finding.icon}</span>
+                                <span className={`font-bold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
                               </div>
                               <p className={`text-sm mb-3 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
                               {finding.evidence?.length > 0 && (
@@ -2356,6 +2350,28 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                       → Confidence {finding.confidence}%: {finding.scoreBreakdown}
                                     </div>
                                   )}
+                                </div>
+                              )}
+                              {/* Potential ATT&CK — kept visually separate from the Detection
+                                  above: this is an inference from the evidence, not the name of
+                                  what was observed. */}
+                              {finding.mitre && (
+                                <div className={`mb-3 p-2.5 rounded border ${darkMode ? 'bg-purple-900/10 border-purple-500/20' : 'bg-purple-50 border-purple-200'}`}>
+                                  <div className={`text-[10px] font-bold tracking-widest mb-1.5 flex items-center gap-1 ${darkMode ? 'text-purple-400/80' : 'text-purple-500'}`}>
+                                    POTENTIAL ATT&CK <span title={MITRE_HYPOTHESIS_NOTE} className="cursor-help">ⓘ</span>
+                                  </div>
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <button
+                                      onClick={() => setMitreFilter(f => f === finding.mitre.id ? null : finding.mitre.id)}
+                                      title={`Filter investigation to ${finding.mitre.id} findings`}
+                                      className={`text-xs font-mono px-2 py-0.5 rounded border transition-colors ${mitreFilter === finding.mitre.id ? 'border-purple-400 text-white bg-purple-600' : 'border-purple-500/50 text-purple-400 bg-purple-900/20 hover:bg-purple-800/30'}`}>
+                                      {finding.mitre.id}
+                                    </button>
+                                    <a href={`https://attack.mitre.org/techniques/${finding.mitre.id.replace('.', '/')}/`} target="_blank" rel="noopener noreferrer"
+                                      className={`text-xs px-2 py-0.5 rounded underline decoration-dotted ${darkMode ? 'text-purple-300/70 bg-purple-900/10 hover:text-purple-200' : 'text-purple-600 bg-purple-50 hover:text-purple-800'}`}>
+                                      {finding.mitre.name} · {finding.mitre.tactic}
+                                    </a>
+                                  </div>
                                 </div>
                               )}
                               {finding.sparklineData && finding.sparklineData.length > 1 && (
@@ -2460,7 +2476,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                 </div>
                               </div>
                               <div>
-                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-0.5`}>MITRE Techniques</div>
+                                <div title={MITRE_HYPOTHESIS_NOTE} className={`text-xs cursor-help flex items-center gap-1 mb-0.5 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Potential ATT&CK <span>ⓘ</span></div>
                                 <div className="flex flex-wrap gap-1">
                                   {allMitreInv.slice(0, 4).map(id => (
                                     <span key={id} className={`text-xs font-mono px-1.5 py-0.5 rounded ${darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-50 text-purple-600'}`}>{id}</span>
@@ -2693,7 +2709,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                 <span className={`text-xs font-bold tabular-nums ${scoreColor(inv.riskScore)}`}>{inv.riskScore}/100</span>
                               </div>
                               {inv.findings[0]?.mitre && (
-                                <span className={`text-xs font-mono ${darkMode ? 'text-purple-400' : 'text-purple-600'}`}>{inv.findings[0].mitre.id} · {inv.findings[0].mitre.tactic}</span>
+                                <span title={MITRE_HYPOTHESIS_NOTE} className={`text-xs font-mono cursor-help ${darkMode ? 'text-purple-400' : 'text-purple-600'}`}>~{inv.findings[0].mitre.id} · {inv.findings[0].mitre.tactic}</span>
                               )}
                             </div>
                           )}
@@ -2883,8 +2899,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                 <span>— {relatedSession.findings[0]?.type}</span>
                                 <span className={`font-bold tabular-nums ${scoreColor(relatedSession.riskScore)}`}>{relatedSession.riskScore}/100</span>
                                 {relatedSession.findings[0]?.mitre && (
-                                  <button onClick={() => setMitreFilter(relatedSession.findings[0].mitre.id)} className={`font-mono px-1.5 py-0.5 rounded ${darkMode ? 'bg-purple-900/30 text-purple-400 hover:bg-purple-800/40' : 'bg-purple-50 text-purple-600 hover:bg-purple-100'} transition-colors`}>
-                                    {relatedSession.findings[0].mitre.id}
+                                  <button onClick={() => setMitreFilter(relatedSession.findings[0].mitre.id)} title={MITRE_HYPOTHESIS_NOTE} className={`font-mono px-1.5 py-0.5 rounded ${darkMode ? 'bg-purple-900/30 text-purple-400 hover:bg-purple-800/40' : 'bg-purple-50 text-purple-600 hover:bg-purple-100'} transition-colors`}>
+                                    ~{relatedSession.findings[0].mitre.id}
                                   </button>
                                 )}
                               </div>
