@@ -32,6 +32,10 @@ const REPORT_TEMPLATE_VERSION = '2.0';
 // emit (T1071, T1595, T1078, T1110, T1110.004, T1563, T1046) — used to show
 // real "MITRE coverage" (observed / possible), not a made-up percentage.
 const TOTAL_RULE_MITRE_TECHNIQUES = 7;
+// Shown wherever a MITRE technique badge appears — a technique mapping is an
+// analytical hypothesis derived from observed behavior, not proof of
+// attacker activity or a claim of ATT&CK certainty.
+const MITRE_HYPOTHESIS_NOTE = 'Potential ATT&CK mapping — an analytical hypothesis based on observed behavior, not proof of attacker activity.';
 
 const LogAnalyzer = () => {
   const [uploadedFile, setUploadedFile] = useState(null);
