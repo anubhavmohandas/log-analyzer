@@ -60,6 +60,7 @@ const LogAnalyzer = () => {
   const [showCorrelationGraph, setShowCorrelationGraph] = useState(true);
   const fileInputRef = useRef(null);
   const ipGeoCacheRef = useRef(new Map());
+  const investigationSectionRef = useRef(null);
 
   const sampleLogs = {
     firewall: `Jun 1 22:01:35 [xx] ns5gt: NetScreen device_id=ns5gt [Root]system-alert-00016: Port scan! From 203.0.113.45:54886 to 192.168.1.100:406, proto TCP (zone Untrust, int untrust). Occurred 1 times. (2004-06-01 22:09:03)
@@ -552,7 +553,13 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
   const getIpThreatContext = (ip, analysisData) => {
     if (!analysisData) return { label: 'Unknown', reason: null, score: null };
     const profile = analysisData.ipProfiles?.[ip];
-    const invSession = (analysisData.investigation || []).find(s => s.identifierType === 'ip' && s.identifier === ip);
+    // Must check BOTH ip-keyed sessions AND user-keyed sessions whose
+    // computed primary sourceIP matches — most sessions are keyed by user,
+    // not IP, so checking identifierType==='ip' alone misses them and shows
+    // a linked, critical-tier IP as "Normal".
+    const invSession = (analysisData.investigation || []).find(
+      s => (s.identifierType === 'ip' && s.identifier === ip) || s.sourceIP === ip
+    );
     if (invSession) {
       return {
         label: invSession.tier === 'critical' ? 'Critical' : invSession.tier === 'review' ? 'Elevated' : 'Monitored',
@@ -678,8 +685,13 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           evidence: [`${bestAutomation.count} calls to "${bestAutomation.type}"`, `Requests arrive ${consistencyWord} every ${meanDur} (±${jitterDur} jitter)`, `Timing is ${cvVal < 0.1 ? 'machine-regular' : 'somewhat variable'} — consistent with a script or scheduled job, not a human clicking`],
           scoreBreakdown: `${bestAutomation.baseScore} (timing regularity) + ${bestAutomation.countBonus} (${bestAutomation.count} events) = ${Math.min(bestAutomation.baseScore + bestAutomation.countBonus, 99)}${bestAutomation.baseScore + bestAutomation.countBonus > 99 ? ', capped at 99' : ''}`,
           caseSummaryData: { type: 'automation', eventType: bestAutomation.type, count: bestAutomation.count, interval: meanDur },
+          // 'confidence': this score is genuine statistical certainty (from
+          // interval variance) that the pattern is scripted — not a
+          // deterministic fact plus a severity judgment, unlike the other rules.
+          scoreType: 'confidence',
+          mitreReason: 'Regular outbound HTTP communication with script-like, near-zero-variance cadence.',
           mitre: { id: 'T1071', name: 'Application Layer Protocol', tactic: 'Command and Control' },
-          mitigations: ['Rate-limit or block this account/IP', 'Require re-authentication', 'Audit accessed data', 'Check for credential compromise'],
+          mitigations: ['Check scheduled jobs / cron tasks for this account', 'Verify service account & API token ownership', 'Rate-limit or block if unauthorized', 'Audit data accessed during polling window'],
           sparklineData: bestAutomation.sparklineData
         });
       }
@@ -698,6 +710,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           evidence: [`${session.eventTypes.size} distinct API/endpoint types accessed`, `${session.events.length} total requests in this session`, `Endpoint types: ${[...session.eventTypes].slice(0, 5).join(', ')}${session.eventTypes.size > 5 ? '…' : ''}`],
           scoreBreakdown: `20 (base) + ${typeScore} (endpoint variety) + ${volScore} (request volume) = ${Math.min(20 + typeScore + volScore, 82)}${20 + typeScore + volScore > 82 ? ', capped at 82' : ''}`,
           caseSummaryData: { type: 'recon', types: session.eventTypes.size, events: session.events.length },
+          // 'severity': whether this occurred is a deterministic fact from the
+          // logs — the score reflects how concerning the observed pattern is,
+          // not uncertainty about whether it happened.
+          scoreType: 'severity',
+          mitreReason: 'Breadth-first access across many distinct endpoints, consistent with automated discovery.',
           mitre: { id: 'T1595', name: 'Active Scanning', tactic: 'Reconnaissance' },
           mitigations: ['Review authorization per endpoint', 'Enable per-endpoint rate limiting', 'Flag account for manual review']
         });
@@ -725,8 +742,10 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           evidence: [`${afterHours.length} after-hours events`, ahTimes.length ? `Timestamps: ${ahTimes.slice(0, 3).join(', ')}${ahTimes.length > 3 ? '…' : ''}` : null, `${(afterFraction * 100).toFixed(0)}% of session activity was after-hours`].filter(Boolean),
           scoreBreakdown: `30 (base) + ${afterHours.length * 6} (${afterHours.length} after-hours events × 6) ${afterFraction > 0.5 ? '+ 10 (majority of session was after-hours)' : ''} = ${ah_confidence}${30 + afterHours.length * 6 + (afterFraction > 0.5 ? 10 : 0) > 75 ? ', capped at 75' : ''}`,
           caseSummaryData: { type: 'afterhours', count: afterHours.length, times: ahTimes.slice(0, 3) },
+          scoreType: 'severity',
+          mitreReason: 'Authenticated access occurred outside expected business hours for this account.',
           mitre: { id: 'T1078', name: 'Valid Accounts', tactic: 'Defense Evasion / Persistence' },
-          mitigations: ['Verify after-hours access rights', 'Alert security team', 'Review for data exfiltration']
+          mitigations: ['Compare against expected shift/on-call schedule', 'Validate VPN/remote-access login source', 'Confirm MFA was satisfied for this session', 'Compare to this account\'s historical login-time pattern']
         });
       }
 
@@ -750,6 +769,10 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           evidence: [`${failedLogins.length} failed authentication events`, hasSuccess ? '✓ Successful login followed the failures — possible account takeover' : 'No subsequent successful login detected', failedLogins[0]?.parameters?.sourceIP ? `Source IP: ${failedLogins[0].parameters.sourceIP}` : null].filter(Boolean),
           scoreBreakdown: `62 (base, 3 failures) + ${Math.min((failedLogins.length - 3) * 5, 26)} (${failedLogins.length - 3} extra failures)${hasSuccess ? ' + 8 (followed by successful login)' : ''} = ${bf_confidence}${bf_base + (hasSuccess?8:0) > (hasSuccess?96:88) ? `, capped at ${hasSuccess?96:88}` : ''}`,
           caseSummaryData: { type: 'bruteforce', count: failedLogins.length, takeover: hasSuccess },
+          scoreType: 'severity',
+          mitreReason: hasSuccess
+            ? 'Repeated authentication failures immediately followed by a successful login on the same account.'
+            : 'Repeated authentication failures against this account, consistent with credential guessing.',
           mitre: hasSuccess
             ? { id: 'T1110.004', name: 'Credential Stuffing', tactic: 'Credential Access' }
             : { id: 'T1110', name: 'Brute Force', tactic: 'Credential Access' },
@@ -1627,6 +1650,36 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       await new Promise(resolve => setTimeout(resolve, 0));
     }
 
+    // A single 401/403 is routine noise, not an event worth an analyst's
+    // attention — the original rule flagged EVERY 401/403 as Medium
+    // unconditionally, which floods the event list with alert fatigue on
+    // any log with normal auth traffic. Downgrade isolated 401/403s (no
+    // repeated pattern from the same actor) back to Low; only keep Medium
+    // when there's a real repeated-access signal (matches the same
+    // 3-occurrence threshold the brute-force rule uses).
+    const authFailGroups = {};
+    results.forEach((r, idx) => {
+      if (r.threatLevel === 'medium' && /^40[13]$/.test(r.parameters.statusCode || '')) {
+        const actor = r.parameters.sourceIP || r.parameters.user;
+        if (!actor) {
+          results[idx].threatLevel = 'low';
+          results[idx].isAlert = false;
+          results[idx].threatReason = 'Isolated HTTP 401/403 with no identifiable source IP/user — treated as routine, not enough signal to flag.';
+          return;
+        }
+        (authFailGroups[actor] ||= []).push(idx);
+      }
+    });
+    Object.values(authFailGroups).forEach(idxs => {
+      if (idxs.length < 3) {
+        idxs.forEach(i => {
+          results[i].threatLevel = 'low';
+          results[i].isAlert = false;
+          results[i].threatReason = `Isolated HTTP 401/403 from this source (${idxs.length} occurrence${idxs.length !== 1 ? 's' : ''} in this log) — below the repeated-pattern threshold used for brute-force detection, treated as routine.`;
+        });
+      }
+    });
+
     // Build per-IP profiles for enriched Source IP panel
     const ipProfiles = {};
     results.forEach(r => {
@@ -2069,7 +2122,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                   {/* Investigation-focused metrics */}
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
                     <div className={`${darkMode ? 'bg-white/10 border-red-500/40' : 'bg-white border-red-300 shadow'} rounded-lg p-4 border`}>
-                      <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${darkMode ? 'text-red-400' : 'text-red-600'}`}>Confirmed Threats</div>
+                      <div title="Events matching a known attack signature — distinct from the Critical tier below, which is high-confidence but unconfirmed behavioral suspicion" className={`text-xs font-bold uppercase tracking-wider mb-1 cursor-help ${darkMode ? 'text-red-400' : 'text-red-600'}`}>Confirmed Incidents</div>
                       <div className="text-3xl font-bold text-red-400">{analysis.threats.length}</div>
                       <div className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{analysis.stats.critical} critical events</div>
                     </div>
@@ -2371,6 +2424,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                       className={`text-xs px-2 py-0.5 rounded underline decoration-dotted ${darkMode ? 'text-purple-300/70 bg-purple-900/10 hover:text-purple-200' : 'text-purple-600 bg-purple-50 hover:text-purple-800'}`}>
                                       {finding.mitre.name} · {finding.mitre.tactic}
                                     </a>
+                                    <span className={`text-xs px-1.5 py-0.5 rounded font-semibold ${finding.confidence >= 88 ? 'bg-red-500/20 text-red-400' : finding.confidence >= 65 ? 'bg-orange-500/20 text-orange-400' : 'bg-blue-500/20 text-blue-400'}`}>
+                                      Mapping confidence: {finding.confidence >= 88 ? 'High' : finding.confidence >= 65 ? 'Medium' : 'Low'}
+                                    </span>
                                   </div>
                                 </div>
                               )}
@@ -2424,7 +2480,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               const visibleInfo     = visibleSessions.filter(s => s.tier === 'info');
 
               return (
-                <div className={`${darkMode ? 'bg-purple-900/20 border-purple-500/40' : 'bg-purple-50 border-purple-200'} rounded-lg p-6 mb-6 border-2`}>
+                <div ref={investigationSectionRef} className={`${darkMode ? 'bg-purple-900/20 border-purple-500/40' : 'bg-purple-50 border-purple-200'} rounded-lg p-6 mb-6 border-2`}>
                   <div className="flex items-center justify-between mb-4">
                     <div className="flex items-center gap-3 flex-wrap">
                       <Search className="w-5 h-5 text-purple-400" />
@@ -2500,7 +2556,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                         );
                       })()}
 
-                      <TierGroup label="🚨 Critical Investigations" color="bg-red-500/20 text-red-400 border border-red-500/30" sessions={visibleCritical} startIdx={0} />
+                      <TierGroup label="🚨 Critical Tier (unconfirmed)" color="bg-red-500/20 text-red-400 border border-red-500/30" sessions={visibleCritical} startIdx={0} />
                       <TierGroup label="⚠️ Needs Review" color="bg-orange-500/20 text-orange-400 border border-orange-500/30" sessions={visibleReview} startIdx={visibleCritical.length} />
                       <TierGroup label="ℹ️ Informational" color="bg-blue-500/20 text-blue-400 border border-blue-500/30" sessions={visibleInfo} startIdx={visibleCritical.length + visibleReview.length} />
 
@@ -2635,22 +2691,37 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                         // one event from a critical-tier investigation session — this
                         // is what visually explains WHY a 95/100 score happened,
                         // instead of leaving the severity chart to speak for itself.
-                        const criticalBuckets = new Map(); // bucketKey -> barTotal (for y placement)
-                        (analysis.investigation || []).filter(s => s.tier === 'critical').forEach(s => {
+                        const criticalBuckets = new Map(); // bucketKey -> { y, sessionIdxs }
+                        const criticalSessions = (analysis.investigation || [])
+                          .map((s, idx) => ({ s, idx }))
+                          .filter(({ s }) => s.tier === 'critical');
+                        criticalSessions.forEach(({ s, idx }) => {
                           (s.sessionEvents || []).forEach(e => {
                             const key = timelineBucketKey(e.parameters?.timestamp);
                             const bucket = analysis.timeline.find(t => t.time === key);
-                            if (bucket) criticalBuckets.set(key, bucket.count);
+                            if (!bucket) return;
+                            if (!criticalBuckets.has(key)) criticalBuckets.set(key, { y: bucket.count, sessionIdxs: new Set() });
+                            criticalBuckets.get(key).sessionIdxs.add(idx);
                           });
                         });
-                        return [...criticalBuckets.entries()].map(([key, y]) => (
-                          <ReferenceDot key={key} x={key} y={y} r={5} fill="#dc2626" stroke={darkMode ? '#0f172a' : '#fff'} strokeWidth={1.5} isFront />
+                        return [...criticalBuckets.entries()].map(([key, { y, sessionIdxs }]) => (
+                          <ReferenceDot
+                            key={key} x={key} y={y} r={5} fill="#dc2626"
+                            stroke={darkMode ? '#0f172a' : '#fff'} strokeWidth={1.5} isFront
+                            style={{ cursor: 'pointer' }}
+                            onClick={() => {
+                              setShowInvestigation(true);
+                              setShowAllSessions(true);
+                              setExpandedSessions(prev => new Set([...prev, ...sessionIdxs]));
+                              investigationSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                            }}
+                          />
                         ));
                       })()}
                     </BarChart>
                   </ResponsiveContainer>
                   <div className="flex gap-4 mt-2 flex-wrap">
-                    <span className="flex items-center gap-1.5 text-xs text-red-500">🔺 Critical investigation</span>
+                    <span className="flex items-center gap-1.5 text-xs text-red-500">🔺 Critical investigation (click to open)</span>
                     <span className="flex items-center gap-1.5 text-xs text-red-400"><span className="w-3 h-3 rounded-sm inline-block bg-red-500" />Critical</span>
                     <span className="flex items-center gap-1.5 text-xs text-orange-400"><span className="w-3 h-3 rounded-sm inline-block bg-orange-500" />High</span>
                     <span className="flex items-center gap-1.5 text-xs text-yellow-400"><span className="w-3 h-3 rounded-sm inline-block bg-yellow-500" />Medium</span>
@@ -2731,10 +2802,13 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               {(() => {
                 const uncatCount = analysis.stats.categoryBreakdown['Uncategorized'] || 0;
                 const uncatShare = analysis.stats.total > 0 ? uncatCount / analysis.stats.total : 0;
-                if (uncatShare < 0.4) return null;
+                const coveragePct = Math.round((1 - uncatShare) * 100);
+                const low = uncatShare >= 0.4;
                 return (
-                  <div className={`text-xs mb-4 px-3 py-2 rounded ${darkMode ? 'bg-yellow-900/20 text-yellow-300 border border-yellow-500/20' : 'bg-yellow-50 text-yellow-700 border border-yellow-200'}`}>
-                    ⚠️ {Math.round(uncatShare * 100)}% of events didn't match any category rule — this log format likely isn't well covered by the current rule set. Treat category-based conclusions with caution for this file.
+                  <div className={`text-xs mb-4 px-3 py-2 rounded flex items-center gap-2 flex-wrap ${low ? (darkMode ? 'bg-yellow-900/20 text-yellow-300 border border-yellow-500/20' : 'bg-yellow-50 text-yellow-700 border border-yellow-200') : (darkMode ? 'bg-white/5 text-gray-400 border border-white/10' : 'bg-gray-50 text-gray-500 border border-gray-200')}`}>
+                    <span className="font-bold">Rule Coverage: {coveragePct}%</span>
+                    <span>of events matched a known category for this log format.</span>
+                    {low && <span>This is low — treat category-based conclusions with caution for this file.</span>}
                   </div>
                 );
               })()}
