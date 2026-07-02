@@ -689,7 +689,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           // interval variance) that the pattern is scripted — not a
           // deterministic fact plus a severity judgment, unlike the other rules.
           scoreType: 'confidence',
-          mitreReason: 'Regular outbound HTTP communication with script-like, near-zero-variance cadence.',
+          mitreReason: 'Observed periodic HTTP requests with near-zero timing jitter, consistent with automated application-layer communication.',
+          primaryEvidence: `${bestAutomation.count} requests · ±${jitterDur} jitter · same endpoint`,
           mitre: { id: 'T1071', name: 'Application Layer Protocol', tactic: 'Command and Control' },
           mitigations: ['Check scheduled jobs / cron tasks for this account', 'Verify service account & API token ownership', 'Rate-limit or block if unauthorized', 'Audit data accessed during polling window'],
           sparklineData: bestAutomation.sparklineData
@@ -714,7 +715,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           // logs — the score reflects how concerning the observed pattern is,
           // not uncertainty about whether it happened.
           scoreType: 'severity',
-          mitreReason: 'Breadth-first access across many distinct endpoints, consistent with automated discovery.',
+          mitreReason: 'Breadth-first access across many distinct endpoints, consistent with automated discovery. No authentication failures or privilege escalation were observed alongside it.',
+          primaryEvidence: `${session.eventTypes.size} endpoint types · ${session.events.length} requests`,
           mitre: { id: 'T1595', name: 'Active Scanning', tactic: 'Reconnaissance' },
           mitigations: ['Review authorization per endpoint', 'Enable per-endpoint rate limiting', 'Flag account for manual review']
         });
@@ -743,7 +745,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           scoreBreakdown: `30 (base) + ${afterHours.length * 6} (${afterHours.length} after-hours events × 6) ${afterFraction > 0.5 ? '+ 10 (majority of session was after-hours)' : ''} = ${ah_confidence}${30 + afterHours.length * 6 + (afterFraction > 0.5 ? 10 : 0) > 75 ? ', capped at 75' : ''}`,
           caseSummaryData: { type: 'afterhours', count: afterHours.length, times: ahTimes.slice(0, 3) },
           scoreType: 'severity',
-          mitreReason: 'Authenticated access occurred outside expected business hours for this account.',
+          mitreReason: 'Access occurred outside configured business hours for this account. No credential misuse or lateral movement was observed alongside it — this is a timing anomaly, not evidence of compromise on its own.',
+          primaryEvidence: `${afterHours.length} after-hours events · ${(afterFraction * 100).toFixed(0)}% of session`,
           mitre: { id: 'T1078', name: 'Valid Accounts', tactic: 'Defense Evasion / Persistence' },
           mitigations: ['Compare against expected shift/on-call schedule', 'Validate VPN/remote-access login source', 'Confirm MFA was satisfied for this session', 'Compare to this account\'s historical login-time pattern']
         });
@@ -771,8 +774,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           caseSummaryData: { type: 'bruteforce', count: failedLogins.length, takeover: hasSuccess },
           scoreType: 'severity',
           mitreReason: hasSuccess
-            ? 'Repeated authentication failures immediately followed by a successful login on the same account.'
-            : 'Repeated authentication failures against this account, consistent with credential guessing.',
+            ? 'Repeated authentication failures immediately followed by a successful login on the same account — the timing is the evidence, not a confirmed takeover.'
+            : 'Repeated authentication failures against this account, consistent with credential guessing. No successful login followed, so account compromise is not confirmed.',
+          primaryEvidence: `${failedLogins.length} failed logins${hasSuccess ? ' · followed by success' : ''}`,
           mitre: hasSuccess
             ? { id: 'T1110.004', name: 'Credential Stuffing', tactic: 'Credential Access' }
             : { id: 'T1110', name: 'Brute Force', tactic: 'Credential Access' },
@@ -814,6 +818,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               evidence: [`${overlapping.length} source IPs with overlapping active time windows`, `IPs: ${overlapping.join(', ')}`, 'Simultaneous activity from different IPs for the same account is a strong hijacking indicator'],
               scoreBreakdown: `72 (base, 2 overlapping IPs) + ${(overlapping.length - 2) * 6} (${overlapping.length - 2} extra overlapping IPs) = ${hijack_conf}${72 + (overlapping.length - 2) * 6 > 92 ? ', capped at 92' : ''}`,
               caseSummaryData: { type: 'hijacking', ips: overlapping },
+              scoreType: 'severity',
+              mitreReason: 'Same account was active from multiple IPs at overlapping times — one identity, simultaneous locations. No lateral movement to other systems was observed.',
+              primaryEvidence: `${overlapping.length} overlapping IPs`,
               mitre: { id: 'T1563', name: 'Remote Service Session Hijacking', tactic: 'Lateral Movement' },
               mitigations: ['Invalidate all active sessions', 'Force re-authentication', 'Investigate both source IPs', 'Enable geo-velocity checks']
             });
@@ -827,6 +834,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               detail: `Same user accessed from ${distinctIPs.length} different IPs: ${distinctIPs.join(', ')}`,
               evidence: [`${distinctIPs.length} distinct source IPs used`, `IPs: ${distinctIPs.join(', ')}`, 'Non-overlapping — may indicate VPN switching or shared credential'],
               caseSummaryData: { type: 'multiip', ips: distinctIPs },
+              scoreType: 'severity',
+              mitreReason: 'Same account used from multiple distinct IPs at non-overlapping times. This alone is common with VPNs and mobile devices — no overlap or credential misuse was observed.',
+              primaryEvidence: `${distinctIPs.length} distinct IPs`,
               mitre: { id: 'T1078', name: 'Valid Accounts', tactic: 'Defense Evasion' },
               mitigations: ['Verify legitimate device switching', 'Check for shared credential use', 'Review access locations']
             });
@@ -862,6 +872,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
             evidence: [`${bestEnumeration.distinct.size} distinct endpoint types in 120s window`, `${bestEnumeration.inWindow.length} total requests in window`, `Types: ${[...bestEnumeration.distinct].join(', ')}`],
             scoreBreakdown: `24 (base) + ${bestEnumeration.distinct.size * 9} (${bestEnumeration.distinct.size} endpoint types × 9) + ${Math.max(0, bestEnumeration.inWindow.length - 6) * 2} (extra requests in window) = ${bestEnumeration.score}${24 + bestEnumeration.distinct.size * 9 + Math.max(0, bestEnumeration.inWindow.length - 6) * 2 > 88 ? ', capped at 88' : ''}`,
             caseSummaryData: { type: 'enumeration', types: bestEnumeration.distinct.size, count: bestEnumeration.inWindow.length },
+            scoreType: 'severity',
+            mitreReason: 'Rapid access to many distinct endpoint types within a short window, consistent with automated discovery. No data exfiltration or write actions were observed.',
+            primaryEvidence: `${bestEnumeration.distinct.size} endpoint types in ${bestEnumeration.inWindow.length} requests / 120s`,
             mitre: { id: 'T1046', name: 'Network Service Discovery', tactic: 'Discovery' },
             mitigations: ['Enable anomaly-based rate limiting', 'Review all accessed endpoints', 'Audit authorization logs']
           });
@@ -2379,15 +2392,23 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                   <span className={`text-[10px] font-bold tracking-widest ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>DETECTION</span>
                                 </div>
                                 <span
-                                  title={`Why flagged:\n${(finding.evidence || []).join('\n')}`}
-                                  className={`text-sm font-bold px-2.5 py-1.5 rounded shrink-0 text-white cursor-help ${scoreBg(finding.confidence)}`}
-                                >{finding.confidence}%</span>
+                                  title={finding.scoreType === 'confidence'
+                                    ? `Detection Confidence: statistical certainty the observed pattern is what it looks like.\n\nWhy flagged:\n${(finding.evidence || []).join('\n')}`
+                                    : `Operational Severity: this is a deterministic detection — the score reflects how concerning the observed pattern is, not uncertainty about whether it happened.\n\nWhy flagged:\n${(finding.evidence || []).join('\n')}`}
+                                  className={`text-right shrink-0 cursor-help`}
+                                >
+                                  <div className={`text-sm font-bold px-2.5 py-1.5 rounded text-white ${scoreBg(finding.confidence)}`}>{finding.confidence}{finding.scoreType === 'confidence' ? '%' : '/100'}</div>
+                                  <div className={`text-[9px] font-semibold mt-0.5 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{finding.scoreType === 'confidence' ? 'DETECTION CONFIDENCE' : 'OPERATIONAL SEVERITY'}</div>
+                                </span>
                               </div>
                               <div className="flex items-center gap-2 flex-wrap mb-2">
                                 <span className="text-lg">{finding.icon}</span>
                                 <span className={`font-bold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
                               </div>
-                              <p className={`text-sm mb-3 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
+                              <p className={`text-sm mb-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
+                              {finding.primaryEvidence && (
+                                <p className={`text-xs mb-3 font-mono ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{finding.primaryEvidence}</p>
+                              )}
                               {finding.evidence?.length > 0 && (
                                 <div className="mb-3">
                                   <div className={`text-xs font-semibold tracking-widest mb-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>EVIDENCE</div>
@@ -2428,6 +2449,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                       Mapping confidence: {finding.confidence >= 88 ? 'High' : finding.confidence >= 65 ? 'Medium' : 'Low'}
                                     </span>
                                   </div>
+                                  {finding.mitreReason && (
+                                    <div className={`text-xs mt-2 pt-2 border-t ${darkMode ? 'border-purple-500/10 text-gray-400' : 'border-purple-200 text-gray-600'}`}>
+                                      <span className="font-semibold">Reason:</span> {finding.mitreReason}
+                                    </div>
+                                  )}
                                 </div>
                               )}
                               {finding.sparklineData && finding.sparklineData.length > 1 && (
