@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { Shield, AlertTriangle, FileText, Upload, Search, Filter, Download, Activity, Clock, Globe, BookmarkPlus, ChevronDown, ChevronUp, MapPin, Eye, EyeOff, Copy, Check, Network } from 'lucide-react';
-import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceDot } from 'recharts';
 
 // Small reusable "Copy IOC" button — for pulling a user/IP/endpoint straight
 // into a ticket or a blocklist without hand-selecting text.
@@ -178,6 +178,21 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     return null;
   };
 
+  // Buckets a timestamp into an hour-wide slot for the timeline chart.
+  // Date-aware timestamps get a real "YYYY-MM-DD HH:00" bucket; time-only
+  // timestamps fall back to "HH:00" (no date to bucket by).
+  const timelineBucketKey = (ts) => {
+    const parsed = parseLogTimestamp(ts);
+    if (!parsed) return 'Unknown';
+    const d = new Date(parsed.ms);
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    if (!parsed.hasDate) return `${hh}:00`;
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd} ${hh}:00`;
+  };
+
   // Human-readable duration: "16m 14s" instead of "974s" / raw std-dev jargon
   const formatDuration = (totalSeconds) => {
     if (totalSeconds == null || isNaN(totalSeconds)) return '—';
@@ -242,7 +257,16 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
 
   const extractParameters = (logLine) => {
     const params = {};
-    const timestampPatterns = [/(\d{2}:\d{2}:\d{2})/, /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/, /(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/, /([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})/];
+    // Order matters: full-date formats MUST be tried before the bare
+    // HH:MM:SS pattern, or the date gets silently discarded — HH:MM:SS
+    // matches as a substring of every ISO timestamp too, so if it ran first
+    // it would win and throw away the day/month/year for every ISO log line.
+    const timestampPatterns = [
+      /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/,
+      /(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/,
+      /([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})/,
+      /(\d{2}:\d{2}:\d{2})/
+    ];
     timestampPatterns.forEach(pattern => { const match = logLine.match(pattern); if (match && !params.timestamp) params.timestamp = match[1]; });
     
     const ipPattern = new RegExp(`(?:src|source|from|client)[=:\\s]+(${IP_ANY_SRC})|(?:^|\\s)(${IP_ANY_SRC})(?=\\s|:|,|$)`, 'gi');
@@ -1370,7 +1394,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
 
 <!-- 6. AFFECTED USERS -->
 <div class="section page-break">
-  <h2><span class="section-num">6</span>Affected Users</h2>
+  <h2><span class="section-num">6</span>Investigated User Accounts</h2>
   <table>
     <thead><tr><th>User / Account</th><th>Events</th><th>Alerts</th><th>Failed Logins</th><th>Risk</th><th>Last Seen</th><th>MITRE</th><th>Source IPs</th></tr></thead>
     <tbody>${userRows}</tbody>
@@ -1583,7 +1607,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           categoryStats[cat] = (categoryStats[cat] || 0) + 1;
           categorySeverity[cat] = (categorySeverity[cat] || 0) + (SEVERITY_WEIGHT[threatLevel] || 1);
         });
-        const timeKey = parameters.timestamp?.split(' ')[0] || parameters.timestamp?.split(':')[0] || 'Unknown';
+        // Bucket by hour (using the real date when available) instead of by
+        // raw timestamp string — bucketing by full-precision ISO timestamps
+        // produces one near-empty bar per event, which is unreadable on
+        // anything but a tiny log.
+        const timeKey = timelineBucketKey(parameters.timestamp);
         if (!timelineData[timeKey]) timelineData[timeKey] = { count: 0, critical: 0, high: 0, medium: 0, low: 0 };
         timelineData[timeKey].count++;
         timelineData[timeKey][threatLevel]++;
@@ -1669,7 +1697,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
   const getTopIPs = () => {
     if (!analysis) return [];
     const profiles = analysis.ipProfiles || {};
-    // Build IP → investigation session map
+    // Build IP → investigation session map. Investigation sessions are keyed
+    // by user OR ip and only carry a sourceIP on a subset of their events —
+    // for logs where the IP field is sparse per-line, a user session's
+    // computed primary sourceIP (session.sourceIP) is the most reliable
+    // link, so check that first before falling back to scanning events.
     const ipInvMap = {};
     (analysis.investigation || []).forEach(s => {
       if (s.identifierType === 'ip') {
@@ -1677,13 +1709,27 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           ipInvMap[s.identifier] = s;
         }
       }
+      if (s.sourceIP && (!ipInvMap[s.sourceIP] || s.riskScore > (ipInvMap[s.sourceIP].riskScore || 0))) {
+        ipInvMap[s.sourceIP] = s;
+      }
       (s.sessionEvents || []).forEach(e => {
         const ip = e.parameters?.sourceIP;
         if (ip && !ipInvMap[ip]) ipInvMap[ip] = s;
       });
     });
+    // "Top" means "matters", not "most raw events": IPs tied to an
+    // investigation session (or with observed critical/alert activity) rank
+    // above high-volume-but-benign IPs, which otherwise dominate ties when
+    // most log lines only carry an IP on a fraction of events.
+    const rankOf = (ip, p) => {
+      const inv = ipInvMap[ip];
+      if (inv) return 3000 + inv.riskScore;
+      if (p.criticalEvents > 0) return 2000 + p.criticalEvents;
+      if (p.threats > 0) return 1000 + p.threats;
+      return p.events;
+    };
     return Object.entries(profiles)
-      .sort(([, a], [, b]) => b.events - a.events)
+      .sort(([ipA, a], [ipB, b]) => rankOf(ipB, b) - rankOf(ipA, a))
       .slice(0, 8)
       .map(([ip, p]) => ({
         ip,
@@ -1725,23 +1771,38 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         link(entityId, ipId);
       }
       const epTypes = [...new Set((s.sessionEvents || []).map(e => e.eventType))].slice(0, 3);
+      const statusToEp = {}; // endpoint type -> most common status code, for chaining ep -> status
       epTypes.forEach(t => {
         const epId = `ep:${t}`;
         bump(epId, 2, t);
         link(entityId, epId);
+        const statusCounts = {};
+        (s.sessionEvents || []).filter(e => e.eventType === t && e.parameters?.statusCode).forEach(e => {
+          statusCounts[e.parameters.statusCode] = (statusCounts[e.parameters.statusCode] || 0) + 1;
+        });
+        const topStatus = Object.entries(statusCounts).sort(([, a], [, b]) => b - a)[0]?.[0];
+        if (topStatus) statusToEp[epId] = topStatus;
+      });
+      // Endpoint -> HTTP status -> MITRE, so the chain reads the way an
+      // analyst actually traces evidence: user, IP, endpoint, response, technique.
+      Object.entries(statusToEp).forEach(([epId, status]) => {
+        const stId = `status:${status}`;
+        bump(stId, 3, status);
+        link(epId, stId);
       });
       s.findings.forEach(f => {
         if (f.mitre) {
           const mId = `mitre:${f.mitre.id}`;
-          bump(mId, 3, f.mitre.id);
-          link(entityId, mId);
+          bump(mId, 4, f.mitre.id);
+          const lastStatus = Object.keys(statusToEp).length > 0 ? `status:${Object.values(statusToEp)[0]}` : null;
+          link(lastStatus && nodes.has(lastStatus) ? lastStatus : entityId, mId);
         }
       });
     });
 
     // Cap each column so the graph stays readable
     const COL_CAP = 8;
-    const byCol = [0, 1, 2, 3].map(col =>
+    const byCol = [0, 1, 2, 3, 4].map(col =>
       [...nodes.values()].filter(n => n.col === col).sort((a, b) => b.count - a.count)
     );
     const kept = new Set();
@@ -1871,7 +1932,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           <div className="flex items-center justify-center gap-3 mb-4">
             <Shield className="w-12 h-12 text-blue-400" />
             <h1 className="text-4xl font-bold bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">
-              CyberNyx Log Analyzer
+              CyberNyx Security Log Analyzer
             </h1>
             <button onClick={() => setDarkMode(!darkMode)} className={`ml-4 p-2 rounded-lg transition-all ${darkMode ? 'bg-white/10 hover:bg-white/20' : 'bg-gray-800/10 hover:bg-gray-800/20'}`} title={darkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}>
               {darkMode ? '☀️' : '🌙'}
@@ -2014,7 +2075,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                       <div className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{criticalSessions} critical tier</div>
                     </div>
                     <div className={`${darkMode ? 'bg-white/10 border-blue-500/40' : 'bg-white border-blue-300 shadow'} rounded-lg p-4 border`}>
-                      <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${darkMode ? 'text-blue-400' : 'text-blue-600'}`}>Affected Users</div>
+                      <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${darkMode ? 'text-blue-400' : 'text-blue-600'}`} title="Users with a flagged session — not confirmed as compromised">Users Investigated</div>
                       <div className="text-3xl font-bold text-blue-400">{affectedUsers}</div>
                       <div className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>{analysis.stats.uniqueIPs} unique IPs</div>
                     </div>
@@ -2387,7 +2448,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                 <div className={`text-sm font-semibold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{topFinding?.type || '—'}</div>
                               </div>
                               <div>
-                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-0.5`}>Affected Users</div>
+                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'} mb-0.5`}>Users Investigated</div>
                                 <div className={`text-sm font-semibold ${darkMode ? 'text-white' : 'text-gray-900'}`}>
                                   {affectedUserIds.length > 0 ? (
                                     <span title={affectedUserIds.join(', ')}>{affectedUserIds.length} user{affectedUserIds.length !== 1 ? 's' : ''}</span>
@@ -2444,10 +2505,10 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
             {analysis.investigation && analysis.investigation.length > 0 && (() => {
               const { nodes, edges, hiddenCount } = buildCorrelationGraph(analysis.investigation);
               if (nodes.length === 0) return null;
-              const COL_X = [70, 260, 450, 640];
-              const COL_LABEL = ['Actor', 'Source IP', 'Endpoint', 'MITRE'];
-              const COL_COLOR = ['#3b82f6', '#f97316', '#06b6d4', '#a855f7'];
-              const byCol = [0, 1, 2, 3].map(c => nodes.filter(n => n.col === c));
+              const COL_X = [60, 220, 380, 540, 680];
+              const COL_LABEL = ['Actor', 'Source IP', 'Endpoint', 'Status', 'MITRE'];
+              const COL_COLOR = ['#3b82f6', '#f97316', '#06b6d4', '#eab308', '#a855f7'];
+              const byCol = [0, 1, 2, 3, 4].map(c => nodes.filter(n => n.col === c));
               const rowH = 42;
               const height = Math.max(160, Math.max(...byCol.map(l => l.length)) * rowH + 40);
               const posOf = {};
@@ -2485,7 +2546,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                   </p>
                   {showCorrelationGraph && (
                     <div className="overflow-x-auto">
-                      <svg width="100%" height={height} viewBox={`0 0 720 ${height}`} style={{ minWidth: 600 }}>
+                      <svg width="100%" height={height} viewBox={`0 0 860 ${height}`} style={{ minWidth: 700 }}>
                         {COL_LABEL.map((label, c) => (
                           <text key={c} x={COL_X[c]} y={16} fontSize="10" fontWeight="700" fill={darkMode ? '#64748b' : '#94a3b8'} textAnchor="middle">{label.toUpperCase()}</text>
                         ))}
@@ -2535,9 +2596,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                     <Activity className="w-5 h-5 text-blue-400" />
                     Activity Timeline
                   </h3>
-                  <p className={`text-xs mb-4 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Severity mix per time period — a bar that's mostly red/orange is what to look at, not just a tall one</p>
+                  <p className={`text-xs mb-4 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Severity mix per hour — a bar that's mostly red/orange is what to look at, not just a tall one. 🔺 marks hours containing a critical-tier investigation.</p>
                   <ResponsiveContainer width="100%" height={220}>
-                    <BarChart data={analysis.timeline} margin={{ top: 4, right: 8, bottom: 20, left: 0 }}>
+                    <BarChart data={analysis.timeline} margin={{ top: 14, right: 8, bottom: 20, left: 0 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke={darkMode ? '#334155' : '#e2e8f0'} />
                       <XAxis dataKey="time" tick={{ fontSize: 10, fill: darkMode ? '#94a3b8' : '#64748b' }} angle={-35} textAnchor="end" interval="preserveStartEnd" />
                       <YAxis tick={{ fontSize: 10, fill: darkMode ? '#94a3b8' : '#64748b' }} />
@@ -2549,9 +2610,27 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                       <Bar dataKey="medium" stackId="sev" name="Medium" fill="#eab308" />
                       <Bar dataKey="high" stackId="sev" name="High" fill="#f97316" />
                       <Bar dataKey="critical" stackId="sev" name="Critical" fill="#ef4444" radius={[2, 2, 0, 0]} />
+                      {(() => {
+                        // Overlay a marker on every hour bucket that contains at least
+                        // one event from a critical-tier investigation session — this
+                        // is what visually explains WHY a 95/100 score happened,
+                        // instead of leaving the severity chart to speak for itself.
+                        const criticalBuckets = new Map(); // bucketKey -> barTotal (for y placement)
+                        (analysis.investigation || []).filter(s => s.tier === 'critical').forEach(s => {
+                          (s.sessionEvents || []).forEach(e => {
+                            const key = timelineBucketKey(e.parameters?.timestamp);
+                            const bucket = analysis.timeline.find(t => t.time === key);
+                            if (bucket) criticalBuckets.set(key, bucket.count);
+                          });
+                        });
+                        return [...criticalBuckets.entries()].map(([key, y]) => (
+                          <ReferenceDot key={key} x={key} y={y} r={5} fill="#dc2626" stroke={darkMode ? '#0f172a' : '#fff'} strokeWidth={1.5} isFront />
+                        ));
+                      })()}
                     </BarChart>
                   </ResponsiveContainer>
                   <div className="flex gap-4 mt-2 flex-wrap">
+                    <span className="flex items-center gap-1.5 text-xs text-red-500">🔺 Critical investigation</span>
                     <span className="flex items-center gap-1.5 text-xs text-red-400"><span className="w-3 h-3 rounded-sm inline-block bg-red-500" />Critical</span>
                     <span className="flex items-center gap-1.5 text-xs text-orange-400"><span className="w-3 h-3 rounded-sm inline-block bg-orange-500" />High</span>
                     <span className="flex items-center gap-1.5 text-xs text-yellow-400"><span className="w-3 h-3 rounded-sm inline-block bg-yellow-500" />Medium</span>
@@ -2628,8 +2707,17 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                 <Activity className="w-5 h-5 text-blue-400" />
                 <h3 className={`text-lg font-semibold ${darkMode ? '' : 'text-gray-900'}`}>Event Categories</h3>
               </div>
-              <p className={`text-xs mb-4 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Sorted by risk-weighted severity, not raw count</p>
-
+              <p className={`text-xs mb-2 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Sorted by risk-weighted severity, not raw count</p>
+              {(() => {
+                const uncatCount = analysis.stats.categoryBreakdown['Uncategorized'] || 0;
+                const uncatShare = analysis.stats.total > 0 ? uncatCount / analysis.stats.total : 0;
+                if (uncatShare < 0.4) return null;
+                return (
+                  <div className={`text-xs mb-4 px-3 py-2 rounded ${darkMode ? 'bg-yellow-900/20 text-yellow-300 border border-yellow-500/20' : 'bg-yellow-50 text-yellow-700 border border-yellow-200'}`}>
+                    ⚠️ {Math.round(uncatShare * 100)}% of events didn't match any category rule — this log format likely isn't well covered by the current rule set. Treat category-based conclusions with caution for this file.
+                  </div>
+                );
+              })()}
               <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
                 {(() => {
                   const entries = Object.entries(analysis.stats.categoryBreakdown)
@@ -2638,11 +2726,12 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                   return entries.map(([category, count]) => {
                     const config = eventCategories[category];
                     const isTop = category === topCat && (analysis.stats.categorySeverity?.[category] || 0) > count; // only flag if it's genuinely riskier-than-flat
+                    const displayLabel = category === 'Uncategorized' ? 'Other / Unclassified' : category;
                     return (
                       <div key={category} className={`${isTop ? (darkMode ? 'bg-red-900/15 border-red-500/30' : 'bg-red-50 border-red-200') : (darkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-gray-200')} rounded-lg p-3 border hover:bg-opacity-80 transition-all`}>
                         <div className="flex items-center gap-2 mb-1">
                           <span className="text-xl">{config?.icon || '📋'}</span>
-                          <span className={`text-xs font-medium truncate ${darkMode ? '' : 'text-gray-900'}`}>{category}</span>
+                          <span className={`text-xs font-medium truncate ${darkMode ? '' : 'text-gray-900'}`} title={displayLabel}>{displayLabel}</span>
                           {isTop && <span title="Highest risk-weighted category">🔥</span>}
                         </div>
                         <div className="text-2xl font-bold text-blue-400">{count}</div>
