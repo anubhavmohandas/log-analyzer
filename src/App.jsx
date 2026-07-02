@@ -1,6 +1,37 @@
 import React, { useState, useRef } from 'react';
-import { Shield, AlertTriangle, FileText, Upload, Search, Filter, Download, Activity, Clock, Globe, BookmarkPlus, ChevronDown, ChevronUp, MapPin, Eye, EyeOff } from 'lucide-react';
+import { Shield, AlertTriangle, FileText, Upload, Search, Filter, Download, Activity, Clock, Globe, BookmarkPlus, ChevronDown, ChevronUp, MapPin, Eye, EyeOff, Copy, Check, Network } from 'lucide-react';
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+
+// Small reusable "Copy IOC" button — for pulling a user/IP/endpoint straight
+// into a ticket or a blocklist without hand-selecting text.
+const CopyButton = ({ value, darkMode, label }) => {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = (e) => {
+    e.stopPropagation();
+    navigator.clipboard?.writeText(String(value)).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    }).catch(() => {});
+  };
+  return (
+    <button
+      onClick={handleCopy}
+      title={label ? `Copy ${label}` : 'Copy'}
+      className={`shrink-0 p-0.5 rounded transition-colors ${copied ? 'text-green-400' : darkMode ? 'text-gray-500 hover:text-white' : 'text-gray-400 hover:text-gray-700'}`}
+    >
+      {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+    </button>
+  );
+};
+
+// Bumped manually when the detection rule set changes — surfaced in reports
+// so an analyst can tell which engine version produced a given finding.
+const DETECTION_ENGINE_VERSION = '2.1.0';
+const REPORT_TEMPLATE_VERSION = '2.0';
+// Total distinct MITRE ATT&CK technique IDs the current rule set can ever
+// emit (T1071, T1595, T1078, T1110, T1110.004, T1563, T1046) — used to show
+// real "MITRE coverage" (observed / possible), not a made-up percentage.
+const TOTAL_RULE_MITRE_TECHNIQUES = 7;
 
 const LogAnalyzer = () => {
   const [uploadedFile, setUploadedFile] = useState(null);
@@ -19,7 +50,12 @@ const LogAnalyzer = () => {
   const [darkMode, setDarkMode] = useState(true);
   const [inputMode, setInputMode] = useState('upload');
   const [logText, setLogText] = useState('');
+  const [analysisProgress, setAnalysisProgress] = useState(0);
+  const [selectedGraphNode, setSelectedGraphNode] = useState(null);
+  const [mitreFilter, setMitreFilter] = useState(null);
+  const [showCorrelationGraph, setShowCorrelationGraph] = useState(true);
   const fileInputRef = useRef(null);
+  const ipGeoCacheRef = useRef(new Map());
 
   const sampleLogs = {
     firewall: `Jun 1 22:01:35 [xx] ns5gt: NetScreen device_id=ns5gt [Root]system-alert-00016: Port scan! From 203.0.113.45:54886 to 192.168.1.100:406, proto TCP (zone Untrust, int untrust). Occurred 1 times. (2004-06-01 22:09:03)
@@ -78,6 +114,85 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
 
   const STATIC_ASSET_RE = /\.(css|js|mjs|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map|webp|avif|otf|mp4|mp3)(\?[^"'\s]*)?(\s|"|'|$)/i;
 
+  // ── IP address patterns (IPv4 + IPv6) ────────────────────────────────────
+  const IPV4_SRC = '\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}';
+  const IPV6_SRC = '(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}|::1|::';
+  const IP_ANY_SRC = `(?:${IPV4_SRC}|${IPV6_SRC})`;
+
+  const isPrivateIP = (ip) => {
+    if (!ip) return false;
+    if (ip.includes(':')) return /^(::1$|fe80:|fc00:|fd00:|::$)/i.test(ip);
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return false;
+    const [a, b] = parts;
+    return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+  };
+
+  // ── Timestamp parsing (date-aware) ───────────────────────────────────────
+  const MONTH_MAP = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+  // Parses a wide range of log timestamp formats into { ms, hasDate }.
+  // hasDate=false means only a time-of-day was found (no day/month/year) —
+  // cross-day ordering/duration math is not reliable for those, so callers
+  // should treat them as "seconds since midnight" only.
+  const parseLogTimestamp = (ts) => {
+    if (!ts) return null;
+    const s = String(ts).trim();
+
+    // ISO 8601: 2024-03-15T08:55:10(.sss)?(Z|±HH:MM)? or space-separated
+    let m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/);
+    if (m) {
+      const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}${m[7] || ''}${m[8] || 'Z'}`;
+      const d = new Date(iso);
+      if (!isNaN(d.getTime())) return { ms: d.getTime(), hasDate: true };
+    }
+
+    // Unix epoch seconds or milliseconds
+    m = s.match(/^(\d{10}|\d{13})$/);
+    if (m) {
+      const n = Number(m[1]);
+      return { ms: m[1].length === 10 ? n * 1000 : n, hasDate: true };
+    }
+
+    // Syslog: "Mar 26 09:36:43" (no year — infer current year, roll back if future)
+    m = s.match(/^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})/);
+    if (m) {
+      const mon = MONTH_MAP[m[1].toLowerCase()];
+      if (mon !== undefined) {
+        const now = new Date();
+        const year = now.getFullYear();
+        let d = new Date(Date.UTC(year, mon, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])));
+        if (d.getTime() - now.getTime() > 24 * 3600 * 1000) {
+          d = new Date(Date.UTC(year - 1, mon, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])));
+        }
+        return { ms: d.getTime(), hasDate: true };
+      }
+    }
+
+    // Time-only fallback: HH:MM:SS or HH:MM (no date component available)
+    m = s.match(/(\d{1,2}):(\d{2}):(\d{2})/);
+    if (m) return { ms: (Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])) * 1000, hasDate: false };
+    m = s.match(/(\d{1,2}):(\d{2})(?!\d)/);
+    if (m) return { ms: (Number(m[1]) * 3600 + Number(m[2]) * 60) * 1000, hasDate: false };
+
+    return null;
+  };
+
+  // Human-readable duration: "16m 14s" instead of "974s" / raw std-dev jargon
+  const formatDuration = (totalSeconds) => {
+    if (totalSeconds == null || isNaN(totalSeconds)) return '—';
+    const s = Math.round(totalSeconds);
+    if (s < 60) return `${s}s`;
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const parts = [];
+    if (h) parts.push(`${h}h`);
+    if (m) parts.push(`${m}m`);
+    if (sec || parts.length === 0) parts.push(`${sec}s`);
+    return parts.join(' ');
+  };
+
   const eventCategories = {
     'Login Attempts': { patterns: [/login.*(success|fail|attempt|denied)|authentication.*(success|fail|error)/i, /failed.*password|invalid.*credentials|auth.*fail|login.*fail/i, /successful.*login|logged in|authentication.*success|login success/i, /\b(ssh|rdp|telnet|ftp)\b.*(login|auth|connect)/i, /\b(401|403)\b.*auth|auth.*\b(401|403)\b/i], icon: '🔐', color: 'blue' },
     'Network Changes': { patterns: [/interface.*up|interface.*down|link.*up|link.*down/i, /route.*add|route.*del|routing.*change/i, /vlan.*config|port.*config|switch.*config/i, /network.*change|topology.*change/i], icon: '🌐', color: 'cyan' },
@@ -130,11 +245,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     const timestampPatterns = [/(\d{2}:\d{2}:\d{2})/, /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/, /(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/, /([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})/];
     timestampPatterns.forEach(pattern => { const match = logLine.match(pattern); if (match && !params.timestamp) params.timestamp = match[1]; });
     
-    const ipPattern = /(?:src|source|from|client)[=:\s]+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|(?:^|\s)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?=\s|:)/gi;
+    const ipPattern = new RegExp(`(?:src|source|from|client)[=:\\s]+(${IP_ANY_SRC})|(?:^|\\s)(${IP_ANY_SRC})(?=\\s|:|,|$)`, 'gi');
     const ips = [...logLine.matchAll(ipPattern)];
     if (ips.length > 0) params.sourceIP = ips[0][1] || ips[0][2];
-    
-    const dstIpPattern = /(?:dst|destination|to|server)[=:\s]+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/i;
+
+    const dstIpPattern = new RegExp(`(?:dst|destination|to|server)[=:\\s]+(${IP_ANY_SRC})`, 'i');
     const dstMatch = logLine.match(dstIpPattern);
     if (dstMatch) params.destinationIP = dstMatch[1];
     
@@ -169,56 +284,60 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     return params;
   };
 
-  const assessThreatLevel = (categories, logLine, params) => {
+  // Returns { level, reason } — the reason string is what powers the "Why
+  // flagged?" explanation in the event detail view, so an analyst can see
+  // exactly which rule fired instead of just a bare severity label.
+  const assessThreatLevelDetailed = (categories, logLine, params) => {
     // Static assets are always informational regardless of other signals
     const url = params.url || '';
-    if (STATIC_ASSET_RE.test(url) || STATIC_ASSET_RE.test(logLine)) return 'low';
+    if (STATIC_ASSET_RE.test(url) || STATIC_ASSET_RE.test(logLine)) return { level: 'low', reason: 'Static asset request — routine, non-actionable traffic.' };
 
     const status = params.statusCode || '';
     // 2xx/3xx on non-static paths are low unless other signals fire
     const isSuccessResponse = /^2\d\d$/.test(status) || /^3\d\d$/.test(status);
 
     // Definite attack language → critical
-    if (/\b(attack|breach|exploit|intrusion|ransomware|malware|backdoor|rootkit|ddos)\b/i.test(logLine)) return 'critical';
+    if (/\b(attack|breach|exploit|intrusion|ransomware|malware|backdoor|rootkit|ddos)\b/i.test(logLine)) return { level: 'critical', reason: 'Log line contains explicit attack/intrusion language (e.g. "attack", "exploit", "malware").' };
 
     // Explicit scan/probe + port activity → high
-    if (/\b(port.*scan|port scan|syn.*flood|scan.*detect)\b/i.test(logLine)) return 'high';
+    if (/\b(port.*scan|port scan|syn.*flood|scan.*detect)\b/i.test(logLine)) return { level: 'high', reason: 'Matches port scan / SYN flood signature.' };
 
     // Brute force / credential spray indicators → high
-    if (/\b(brute.?force|credential.*stuff|account.*lock)\b/i.test(logLine)) return 'high';
+    if (/\b(brute.?force|credential.*stuff|account.*lock)\b/i.test(logLine)) return { level: 'high', reason: 'Matches brute-force / credential-stuffing keyword.' };
 
     const hasSecurityAlert = categories.includes('Security Alerts');
     const hasAccessControl = categories.includes('Access Control');
 
     // Explicit denial/block from firewall/ACL
-    if (categories.includes('Firewall Actions') && /\b(deny|block|drop|reject)\b/i.test(logLine)) return 'medium';
+    if (categories.includes('Firewall Actions') && /\b(deny|block|drop|reject)\b/i.test(logLine)) return { level: 'medium', reason: 'Firewall/ACL explicitly denied or blocked this traffic.' };
 
     // 401/403 responses — medium (not high; single 403 is routine)
-    if (/^40[13]$/.test(status)) return 'medium';
+    if (/^40[13]$/.test(status)) return { level: 'medium', reason: `HTTP ${status} response — unauthorized/forbidden.` };
 
     // Unauthorized / access denied keywords — but not in static-asset context
     if (/\bunauthorized\b|\baccess denied\b|\bforbidden\b/i.test(logLine)) {
-      if (hasSecurityAlert || hasAccessControl) return 'high';
-      return 'medium';
+      if (hasSecurityAlert || hasAccessControl) return { level: 'high', reason: 'Unauthorized/access-denied language combined with a Security Alert or Access Control category match.' };
+      return { level: 'medium', reason: 'Log line contains unauthorized/access-denied language.' };
     }
 
     // Login/auth failures — medium (brute force is caught earlier with explicit keyword)
-    if (categories.includes('Login Attempts') && /\b(fail|denied|invalid|bad.*password)\b/i.test(logLine)) return 'medium';
+    if (categories.includes('Login Attempts') && /\b(fail|denied|invalid|bad.*password)\b/i.test(logLine)) return { level: 'medium', reason: 'Failed login/authentication attempt.' };
 
     // Critical resource state
-    if (categories.includes('Resource Alerts') && /\b(critical|exhausted|overload)\b/i.test(logLine)) return 'high';
+    if (categories.includes('Resource Alerts') && /\b(critical|exhausted|overload)\b/i.test(logLine)) return { level: 'high', reason: 'Resource usage reported as critical/exhausted/overloaded.' };
 
     // Server errors (5xx) on non-static paths
-    if (/^5\d\d$/.test(status)) return 'medium';
+    if (/^5\d\d$/.test(status)) return { level: 'medium', reason: `HTTP ${status} server error.` };
 
     // Suspicious data transfer
-    if (categories.includes('Data Transfer') && /\b(unusual|abnormal|exfil)\b/i.test(logLine)) return 'high';
+    if (categories.includes('Data Transfer') && /\b(unusual|abnormal|exfil)\b/i.test(logLine)) return { level: 'high', reason: 'Unusual/abnormal data transfer volume or pattern — possible exfiltration.' };
 
-    if (hasSecurityAlert) return 'high';
-    if (hasAccessControl && !isSuccessResponse) return 'medium';
+    if (hasSecurityAlert) return { level: 'high', reason: 'Matched a Security Alerts category pattern.' };
+    if (hasAccessControl && !isSuccessResponse) return { level: 'medium', reason: 'Matched an Access Control category pattern on a non-success response.' };
 
-    return 'low';
+    return { level: 'low', reason: 'No high-risk pattern matched — classified as routine/informational.' };
   };
+
 
   const detectAdvancedThreats = (events) => {
     const threats = [];
@@ -341,34 +460,91 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     return threats;
   };
 
-  const generateIPIntelligence = (ip) => {
-    const firstOctet = parseInt(ip.split('.')[0]);
-    const secondOctet = parseInt(ip.split('.')[1]);
-    
-    if (firstOctet === 10 || (firstOctet === 172 && secondOctet >= 16 && secondOctet <= 31) || (firstOctet === 192 && secondOctet === 168)) {
-      return { country: 'Local Network', city: 'Internal', isp: 'Private Network', risk: 'Low', type: 'Corporate' };
-    } else if (firstOctet >= 203 && firstOctet <= 223) {
-      const regions = [{ country: 'China', city: 'Beijing', isp: 'China Telecom' }, { country: 'Japan', city: 'Tokyo', isp: 'NTT' }, { country: 'India', city: 'Mumbai', isp: 'Tata' }];
-      const region = regions[secondOctet % regions.length];
-      return { ...region, risk: Math.random() > 0.6 ? 'High' : 'Medium', type: 'Residential' };
-    } else if (firstOctet >= 198 && firstOctet <= 199) {
-      const cities = ['Virginia', 'California', 'Oregon'];
-      const isps = ['Amazon AWS', 'Google Cloud', 'Microsoft Azure'];
-      return { country: 'United States', city: cities[secondOctet % 3], isp: isps[secondOctet % 3], risk: 'Medium', type: 'Datacenter' };
-    } else {
-      const regions = [{ country: 'United States', city: 'New York', isp: 'Verizon' }, { country: 'Germany', city: 'Frankfurt', isp: 'Hetzner' }, { country: 'Russia', city: 'Moscow', isp: 'Rostelecom' }];
-      const region = regions[(firstOctet + secondOctet) % regions.length];
-      return { ...region, risk: region.country === 'Russia' ? 'High' : 'Medium', type: 'Residential' };
+  // ── Real IP geolocation (ipapi.co — free tier, HTTPS, no key required for
+  // moderate use). Private/local IPs are resolved instantly with no network
+  // call. Anything that fails or is rate-limited is marked explicitly rather
+  // than filled in with guessed data — an analyst should never see fabricated
+  // geolocation presented as fact. ────────────────────────────────────────
+  const fetchIPGeo = async (ip) => {
+    if (ipGeoCacheRef.current.has(ip)) return ipGeoCacheRef.current.get(ip);
+    if (isPrivateIP(ip)) {
+      const local = { status: 'ok', country: 'Private Network', city: 'Internal', region: '', isp: 'RFC1918 / Local', type: 'Private' };
+      ipGeoCacheRef.current.set(ip, local);
+      return local;
+    }
+    try {
+      const key = import.meta.env?.VITE_IPAPI_KEY;
+      const url = `https://ipapi.co/${encodeURIComponent(ip)}/json/${key ? `?key=${key}` : ''}`;
+      const res = await fetch(url);
+      if (res.status === 429) {
+        const limited = { status: 'rate_limited' };
+        ipGeoCacheRef.current.set(ip, limited);
+        return limited;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.error) throw new Error(data.reason || 'lookup failed');
+      const result = {
+        status: 'ok',
+        country: data.country_name || 'Unknown',
+        city: data.city || 'Unknown',
+        region: data.region || '',
+        isp: data.org || 'Unknown',
+        asn: data.asn || null,
+        type: 'Public'
+      };
+      ipGeoCacheRef.current.set(ip, result);
+      return result;
+    } catch (e) {
+      const failed = { status: 'error', message: e?.message || 'lookup failed' };
+      ipGeoCacheRef.current.set(ip, failed);
+      return failed;
     }
   };
 
+  // Fires off geolocation lookups in the background (bounded concurrency) and
+  // streams results into analysis.ipIntelligence as they resolve, instead of
+  // blocking the whole analysis on the network.
+  const enrichIPIntelligence = async (ips) => {
+    const CONCURRENCY = 4;
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < ips.length) {
+        const ip = ips[cursor++];
+        const result = await fetchIPGeo(ip);
+        setAnalysis(prev => (prev ? { ...prev, ipIntelligence: { ...prev.ipIntelligence, [ip]: result } } : prev));
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, ips.length) }, worker));
+  };
+
+  // Real, computed threat context for an IP — derived from what the analyzer
+  // actually observed (investigation sessions, critical events, alerts),
+  // never from geolocation. This replaces the old fabricated "risk" field.
+  const getIpThreatContext = (ip, analysisData) => {
+    if (!analysisData) return { label: 'Unknown', reason: null, score: null };
+    const profile = analysisData.ipProfiles?.[ip];
+    const invSession = (analysisData.investigation || []).find(s => s.identifierType === 'ip' && s.identifier === ip);
+    if (invSession) {
+      return {
+        label: invSession.tier === 'critical' ? 'Critical' : invSession.tier === 'review' ? 'Elevated' : 'Monitored',
+        reason: invSession.findings[0]?.type || null,
+        score: invSession.riskScore
+      };
+    }
+    if (profile?.criticalEvents > 0) return { label: 'Critical', reason: `${profile.criticalEvents} critical event${profile.criticalEvents !== 1 ? 's' : ''}`, score: null };
+    if (profile?.threats > 0) return { label: 'Elevated', reason: `${profile.threats} alert${profile.threats !== 1 ? 's' : ''}`, score: null };
+    return { label: 'Normal', reason: null, score: null };
+  };
+
+  // Legacy-shaped helper kept for all existing call sites (interval calc,
+  // sorting, hour-of-day extraction). Now backed by the real date-aware
+  // parser above — for timestamps with a full date this returns real epoch
+  // seconds (so cross-day math is correct); for time-only timestamps it
+  // falls back to seconds-since-midnight, same as before.
   const parseTimestampToSeconds = (ts) => {
-    if (!ts) return null;
-    const hms = ts.match(/(\d{2}):(\d{2}):(\d{2})/);
-    if (hms) return parseInt(hms[1]) * 3600 + parseInt(hms[2]) * 60 + parseInt(hms[3]);
-    const hm = ts.match(/(\d{1,2}):(\d{2})(?!\d)/);
-    if (hm) return parseInt(hm[1]) * 3600 + parseInt(hm[2]) * 60;
-    return null;
+    const parsed = parseLogTimestamp(ts);
+    return parsed ? Math.floor(parsed.ms / 1000) : null;
   };
 
   const computeIntervalStats = (timestamps) => {
@@ -448,6 +624,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         // Confidence: CV drives base score, count adds up to +8 bonus
         let score = cv < 0.03 ? 95 : cv < 0.08 ? 86 : cv < 0.15 ? 74 : cv < 0.25 ? 58 : cv < 0.40 ? 42 : 0;
         if (score === 0) return;
+        const baseScore = score;
         const countBonus = Math.min(Math.floor((evts.length - 4) / 3) * 2, 8);
         score = Math.min(score + countBonus, 99);
         if (!bestAutomation || score > bestAutomation.score) {
@@ -456,20 +633,23 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
             .filter(x => x.secs !== null)
             .sort((a, b) => a.secs - b.secs);
           const sparklineData = sortedTs.slice(1).map((x, i) => ({ idx: i + 1, interval: x.secs - sortedTs[i].secs }));
-          bestAutomation = { type, count: evts.length, stats, score, sparklineData };
+          bestAutomation = { type, count: evts.length, stats, score, baseScore, countBonus, sparklineData };
         }
       });
 
       if (bestAutomation) {
-        const intervalStr = bestAutomation.stats.mean.toFixed(1);
-        const sigmaStr = bestAutomation.stats.stdDev.toFixed(2);
+        const meanDur = formatDuration(bestAutomation.stats.mean);
+        const jitterDur = formatDuration(bestAutomation.stats.stdDev);
+        const cvVal = bestAutomation.stats.stdDev / bestAutomation.stats.mean;
+        const consistencyWord = cvVal < 0.03 ? 'exactly' : cvVal < 0.08 ? 'almost exactly' : cvVal < 0.15 ? 'very regularly' : 'roughly';
         sessionFindings.push({
           type: 'Automated API Polling',
           confidence: bestAutomation.score,
           icon: '🤖',
-          detail: `"${bestAutomation.type}" called ${bestAutomation.count} times — mean interval ${intervalStr}s (σ = ${sigmaStr}s)`,
-          evidence: [`${bestAutomation.count} calls to "${bestAutomation.type}"`, `Average interval: ${intervalStr}s`, `Std deviation: ${sigmaStr}s — near-zero indicates scripted timing`, `CV = ${(bestAutomation.stats.stdDev / bestAutomation.stats.mean).toFixed(3)}`],
-          caseSummaryData: { type: 'automation', eventType: bestAutomation.type, count: bestAutomation.count, interval: intervalStr, sigma: sigmaStr },
+          detail: `${bestAutomation.count} requests to "${bestAutomation.type}" — ${consistencyWord} every ${meanDur}`,
+          evidence: [`${bestAutomation.count} calls to "${bestAutomation.type}"`, `Requests arrive ${consistencyWord} every ${meanDur} (±${jitterDur} jitter)`, `Timing is ${cvVal < 0.1 ? 'machine-regular' : 'somewhat variable'} — consistent with a script or scheduled job, not a human clicking`],
+          scoreBreakdown: `${bestAutomation.baseScore} (timing regularity) + ${bestAutomation.countBonus} (${bestAutomation.count} events) = ${Math.min(bestAutomation.baseScore + bestAutomation.countBonus, 99)}${bestAutomation.baseScore + bestAutomation.countBonus > 99 ? ', capped at 99' : ''}`,
+          caseSummaryData: { type: 'automation', eventType: bestAutomation.type, count: bestAutomation.count, interval: meanDur },
           mitre: { id: 'T1071', name: 'Application Layer Protocol', tactic: 'Command and Control' },
           mitigations: ['Rate-limit or block this account/IP', 'Require re-authentication', 'Audit accessed data', 'Check for credential compromise'],
           sparklineData: bestAutomation.sparklineData
@@ -488,6 +668,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           icon: '🔍',
           detail: `Accessed ${session.eventTypes.size} distinct endpoint types across ${session.events.length} requests`,
           evidence: [`${session.eventTypes.size} distinct API/endpoint types accessed`, `${session.events.length} total requests in this session`, `Endpoint types: ${[...session.eventTypes].slice(0, 5).join(', ')}${session.eventTypes.size > 5 ? '…' : ''}`],
+          scoreBreakdown: `20 (base) + ${typeScore} (endpoint variety) + ${volScore} (request volume) = ${Math.min(20 + typeScore + volScore, 82)}${20 + typeScore + volScore > 82 ? ', capped at 82' : ''}`,
           caseSummaryData: { type: 'recon', types: session.eventTypes.size, events: session.events.length },
           mitre: { id: 'T1595', name: 'Active Scanning', tactic: 'Reconnaissance' },
           mitigations: ['Review authorization per endpoint', 'Enable per-endpoint rate limiting', 'Flag account for manual review']
@@ -498,7 +679,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       const afterHours = session.events.filter(e => {
         const s = parseTimestampToSeconds(e.parameters.timestamp || '');
         if (s === null) return false;
-        const h = Math.floor(s / 3600);
+        // % 24 is required here: s may now be real epoch seconds (date-aware
+        // timestamps), not just seconds-since-midnight.
+        const h = Math.floor(s / 3600) % 24;
         return h < 6 || h >= 22;
       });
       if (afterHours.length >= 2) {
@@ -512,6 +695,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           icon: '🌙',
           detail: `${afterHours.length} events outside business hours (before 06:00 or after 22:00)`,
           evidence: [`${afterHours.length} after-hours events`, ahTimes.length ? `Timestamps: ${ahTimes.slice(0, 3).join(', ')}${ahTimes.length > 3 ? '…' : ''}` : null, `${(afterFraction * 100).toFixed(0)}% of session activity was after-hours`].filter(Boolean),
+          scoreBreakdown: `30 (base) + ${afterHours.length * 6} (${afterHours.length} after-hours events × 6) ${afterFraction > 0.5 ? '+ 10 (majority of session was after-hours)' : ''} = ${ah_confidence}${30 + afterHours.length * 6 + (afterFraction > 0.5 ? 10 : 0) > 75 ? ', capped at 75' : ''}`,
           caseSummaryData: { type: 'afterhours', count: afterHours.length, times: ahTimes.slice(0, 3) },
           mitre: { id: 'T1078', name: 'Valid Accounts', tactic: 'Defense Evasion / Persistence' },
           mitigations: ['Verify after-hours access rights', 'Alert security team', 'Review for data exfiltration']
@@ -536,6 +720,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           icon: '🔑',
           detail: `${failedLogins.length} failed login attempt${failedLogins.length > 1 ? 's' : ''}${hasSuccess ? ' followed by successful authentication' : ''}`,
           evidence: [`${failedLogins.length} failed authentication events`, hasSuccess ? '✓ Successful login followed the failures — possible account takeover' : 'No subsequent successful login detected', failedLogins[0]?.parameters?.sourceIP ? `Source IP: ${failedLogins[0].parameters.sourceIP}` : null].filter(Boolean),
+          scoreBreakdown: `62 (base, 3 failures) + ${Math.min((failedLogins.length - 3) * 5, 26)} (${failedLogins.length - 3} extra failures)${hasSuccess ? ' + 8 (followed by successful login)' : ''} = ${bf_confidence}${bf_base + (hasSuccess?8:0) > (hasSuccess?96:88) ? `, capped at ${hasSuccess?96:88}` : ''}`,
           caseSummaryData: { type: 'bruteforce', count: failedLogins.length, takeover: hasSuccess },
           mitre: hasSuccess
             ? { id: 'T1110.004', name: 'Credential Stuffing', tactic: 'Credential Access' }
@@ -576,6 +761,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               icon: '👥',
               detail: `User active simultaneously from ${overlapping.length} IPs: ${overlapping.join(', ')}`,
               evidence: [`${overlapping.length} source IPs with overlapping active time windows`, `IPs: ${overlapping.join(', ')}`, 'Simultaneous activity from different IPs for the same account is a strong hijacking indicator'],
+              scoreBreakdown: `72 (base, 2 overlapping IPs) + ${(overlapping.length - 2) * 6} (${overlapping.length - 2} extra overlapping IPs) = ${hijack_conf}${72 + (overlapping.length - 2) * 6 > 92 ? ', capped at 92' : ''}`,
               caseSummaryData: { type: 'hijacking', ips: overlapping },
               mitre: { id: 'T1563', name: 'Remote Service Session Hijacking', tactic: 'Lateral Movement' },
               mitigations: ['Invalidate all active sessions', 'Force re-authentication', 'Investigate both source IPs', 'Enable geo-velocity checks']
@@ -623,6 +809,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
             icon: '📡',
             detail: `${bestEnumeration.distinct.size} distinct endpoint types accessed within a 2-minute window (${bestEnumeration.inWindow.length} requests)`,
             evidence: [`${bestEnumeration.distinct.size} distinct endpoint types in 120s window`, `${bestEnumeration.inWindow.length} total requests in window`, `Types: ${[...bestEnumeration.distinct].join(', ')}`],
+            scoreBreakdown: `24 (base) + ${bestEnumeration.distinct.size * 9} (${bestEnumeration.distinct.size} endpoint types × 9) + ${Math.max(0, bestEnumeration.inWindow.length - 6) * 2} (extra requests in window) = ${bestEnumeration.score}${24 + bestEnumeration.distinct.size * 9 + Math.max(0, bestEnumeration.inWindow.length - 6) * 2 > 88 ? ', capped at 88' : ''}`,
             caseSummaryData: { type: 'enumeration', types: bestEnumeration.distinct.size, count: bestEnumeration.inWindow.length },
             mitre: { id: 'T1046', name: 'Network Service Discovery', tactic: 'Discovery' },
             mitigations: ['Enable anomaly-based rate limiting', 'Review all accessed endpoints', 'Audit authorization logs']
@@ -642,7 +829,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         let caseSummary = '';
         const entity = session.identifierType === 'user' ? `User ${session.identifier}` : `IP ${session.identifier}`;
         if (d.type === 'automation') {
-          caseSummary = `${entity} issued ${d.count} "${d.eventType}" requests with a near-constant interval of ${d.interval}s (σ = ${d.sigma}s). The request cadence is machine-consistent — this is not interactive human behavior. Likely a script, integration, or compromised automated process.`;
+          caseSummary = `${entity} issued ${d.count} "${d.eventType}" requests, arriving every ${d.interval} with almost no variation. The request cadence is machine-consistent — this is not interactive human behavior. Likely a script, integration, or compromised automated process.`;
         } else if (d.type === 'bruteforce') {
           caseSummary = `${entity} generated ${d.count} authentication failures${d.takeover ? ', followed by a successful login — indicating likely account takeover' : ' with no subsequent success'}. This pattern is consistent with credential brute-forcing or a credential stuffing campaign.`;
         } else if (d.type === 'hijacking') {
@@ -666,6 +853,22 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           return (sa ?? 0) - (sb ?? 0);
         });
 
+        // Primary source IP for this session (most frequent, for user-keyed sessions)
+        const ipCounts = {};
+        session.events.forEach(e => { const ip = e.parameters.sourceIP; if (ip) ipCounts[ip] = (ipCounts[ip] || 0) + 1; });
+        const primaryIP = session.identifierType === 'ip' ? session.identifier : (Object.entries(ipCounts).sort(([, a], [, b]) => b - a)[0]?.[0] || null);
+
+        // Real duration: first-seen → last-seen, using date-aware parsing where available
+        const parsedTimes = session.events.map(e => parseLogTimestamp(e.parameters.timestamp || '')).filter(Boolean);
+        const datedTimes = parsedTimes.filter(t => t.hasDate);
+        const timePool = datedTimes.length >= 2 ? datedTimes : parsedTimes;
+        let durationSeconds = null;
+        if (timePool.length >= 2) {
+          const sortedMs = timePool.map(t => t.ms).sort((a, b) => a - b);
+          durationSeconds = (sortedMs[sortedMs.length - 1] - sortedMs[0]) / 1000;
+        }
+        const lastSeenRaw = [...session.events].reverse().find(e => e.parameters.timestamp)?.parameters.timestamp || null;
+
         findings.push({
           identifier: session.identifier,
           identifierType: session.identifierType,
@@ -676,7 +879,10 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           tier,
           caseSummary,
           sessionEvents: sortedEvents.slice(0, 60),
-          findings: sessionFindings
+          findings: sessionFindings,
+          sourceIP: primaryIP,
+          lastSeenRaw,
+          durationSeconds
         });
       }
     });
@@ -687,14 +893,14 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
   const analyzeFromPaste = () => {
     if (!logText.trim()) return;
     setLoading(true);
-    setTimeout(() => {
-      try { analyzeLogFile(logText.trim(), 'pasted_log.txt'); }
+    setTimeout(async () => {
+      try { await analyzeLogFile(logText.trim(), 'pasted_log.txt'); }
       catch (e) { console.error('Paste analysis error:', e); alert(`Analysis error: ${e?.message || 'Unknown error'}`); }
       finally { setLoading(false); }
     }, 300);
   };
 
-  const generateReport = () => {
+  const generateReport = async () => {
     if (!analysis) return;
     const timestamp = new Date().toLocaleString();
     const filename = analysis.stats.fileName || 'Unknown';
@@ -712,8 +918,47 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       : analysis.stats.medium > 0 ? 'MEDIUM' : 'LOW';
     const riskBg = { CRITICAL:'#dc2626', HIGH:'#ea580c', 'MEDIUM-HIGH':'#d97706', MEDIUM:'#ca8a04', LOW:'#16a34a' }[overallRisk];
 
+    // ── case metadata — real, computed values only. No VPN/TOR/ASN-per-IP
+    // claims here: the free geolocation API doesn't reliably provide that,
+    // and fabricating it would be the exact problem this report was
+    // rebuilt to get away from. ─────────────────────────────────────────
+    const caseId = `CN-${new Date().toISOString().slice(0,10).replace(/-/g,'')}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
+    const rulesTriggered = new Set(inv.flatMap(s => s.findings.map(f => f.type))).size;
+    const mitreObserved = new Set(inv.flatMap(s => s.findings.map(f => f.mitre?.id).filter(Boolean)));
+    let logHash = null;
+    try {
+      if (window.crypto?.subtle) {
+        const raw = analysis.results.map(r => r.originalLog).join('\n');
+        const digestBuf = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+        logHash = Array.from(new Uint8Array(digestBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (hashErr) { console.warn('Log integrity hash unavailable:', hashErr); }
+
+    // ── analyst conclusion / verdict — the "should I panic?" answer,
+    // computed from actual counts (never invented). ─────────────────────
+    const criticalSessions = inv.filter(s => s.tier === 'critical').length;
+    const highestRisk = inv[0]?.riskScore ?? null;
+    let verdictHeadline, verdictBody;
+    if (threats.length > 0) {
+      verdictHeadline = 'Confirmed Threat Activity';
+      verdictBody = `This log file contains <strong>${threats.length} confirmed threat${threats.length !== 1 ? 's' : ''}</strong> matching known attack signatures (${[...new Set(threats.map(t => t.type))].join(', ')}). This is not ambiguous — treat as an active incident and follow the recommendations below immediately.`;
+    } else if (criticalSessions > 0) {
+      verdictHeadline = 'No Confirmed Compromise — High-Confidence Suspicious Behavior';
+      verdictBody = `No events matched a known attack signature, so there is <strong>no confirmed compromise</strong>. However, <strong>${criticalSessions} session${criticalSessions !== 1 ? 's show' : ' shows'} high-confidence behavioral anomalies</strong> (highest risk score ${highestRisk}/100) — automated access, credential attacks, or session anomalies that warrant validation before being ruled out.`;
+    } else if (inv.length > 0) {
+      verdictHeadline = 'No Confirmed Compromise — Lower-Confidence Anomalies Present';
+      verdictBody = `No confirmed threats and no high-confidence behavioral findings were identified. <strong>${inv.length} lower-confidence session${inv.length !== 1 ? 's were' : ' was'}</strong> flagged for awareness (highest risk score ${highestRisk}/100). Routine monitoring is sufficient unless corroborated by other evidence.`;
+    } else {
+      verdictHeadline = 'No Findings';
+      verdictBody = `No confirmed threats or suspicious behavioral sessions were identified in this log file.`;
+    }
+
     // ── narrative: explain what drove severity counts ──────────────────────
-    const catEntries = Object.entries(analysis.stats.categoryBreakdown).sort(([,a],[,b]) => b-a);
+    // Sorted by risk-weighted severity (categorySeverity), not raw volume —
+    // a small category full of critical events should surface before a huge
+    // pile of routine, low-severity traffic.
+    const catEntries = Object.entries(analysis.stats.categoryBreakdown)
+      .sort(([catA],[catB]) => (analysis.stats.categorySeverity?.[catB]||0) - (analysis.stats.categorySeverity?.[catA]||0));
     const topCat = catEntries[0]?.[0] || 'Unknown';
     const topCatCount = catEntries[0]?.[1] || 0;
     const topCatPct = pct(topCatCount);
@@ -757,7 +1002,9 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       .slice(0, 30);
 
     // ── category breakdown bar rows ───────────────────────────────────────
-    const maxCat = catEntries[0]?.[1] || 1;
+    // Bar width is relative to the largest raw count (not the top-severity
+    // category, which may have a small count) so bars stay within 100%.
+    const maxCat = Math.max(1, ...catEntries.map(([, c]) => c));
     const catRows = catEntries.slice(0, 14).map(([cat, count]) => {
       const barW = Math.round((count / maxCat) * 100);
       return `<tr>
@@ -825,22 +1072,35 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     }).join('') : `<div class="clean-card">✅ No suspicious behavioral sessions detected.</div>`;
 
     // ── affected users table ──────────────────────────────────────────────
-    const userRows = topUsers.length > 0 ? topUsers.map(([u, d]) => `<tr>
+    const userRows = topUsers.length > 0 ? topUsers.map(([u, d]) => {
+      const userSession = inv.find(s => s.identifierType === 'user' && s.identifier === u);
+      const lastSeen = analysis.results.slice().reverse().find(r => r.parameters.user === u)?.parameters.timestamp || '—';
+      const mitreId = userSession?.findings[0]?.mitre?.id || '—';
+      return `<tr>
       <td style="font-family:monospace;font-weight:600">${esc(u)}</td>
       <td>${d.events.toLocaleString()}</td>
       <td style="font-weight:700;color:${d.threats>0?'#ea580c':'#16a34a'}">${d.threats}</td>
       <td style="color:${d.failedLogins>0?'#dc2626':'#334155'}">${d.failedLogins}</td>
+      <td style="font-weight:700;color:${userSession?scoreColorHex(userSession.riskScore):'#94a3b8'}">${userSession ? `${userSession.riskScore}/100` : '—'}</td>
+      <td style="font-family:monospace;font-size:11px;color:#64748b">${esc(lastSeen)}</td>
+      <td style="font-family:monospace;font-size:11px;color:#7c3aed">${esc(mitreId)}</td>
       <td>${[...d.ips].slice(0,3).join(', ')}</td>
-    </tr>`).join('') : `<tr><td colspan="5" style="color:#94a3b8;text-align:center">No authenticated user activity found</td></tr>`;
+    </tr>`;
+    }).join('') : `<tr><td colspan="8" style="color:#94a3b8;text-align:center">No authenticated user activity found</td></tr>`;
 
     // ── affected IPs table ────────────────────────────────────────────────
+    // "Risk" here is derived from what the analyzer actually observed for
+    // this IP (investigation findings / critical events), never from
+    // geolocation — geolocation only supplies location/ISP, when available.
     const ipRows = topIPs.map((item, i) => {
-      const riskColor = item.intel?.risk==='High'?'#dc2626':item.intel?.risk==='Medium'?'#ea580c':'#16a34a';
+      const ctx = getIpThreatContext(item.ip, analysis);
+      const riskColor = ctx.label==='Critical'?'#dc2626':(ctx.label==='Elevated'||ctx.label==='Monitored')?'#ea580c':'#16a34a';
+      const locationText = item.intel?.status === 'ok' ? `${esc(item.intel.country)}, ${esc(item.intel.city)}` : item.intel?.status ? 'Unavailable' : 'Pending';
       return `<tr>
         <td>${i+1}</td>
         <td style="font-family:monospace;font-weight:600">${esc(item.ip)}</td>
-        <td>${item.intel?`${esc(item.intel.country)}, ${esc(item.intel.city)}`:'—'}</td>
-        <td style="font-weight:700;color:${riskColor}">${item.intel?.risk||'—'}</td>
+        <td>${locationText}</td>
+        <td style="font-weight:700;color:${riskColor}">${esc(ctx.label)}</td>
         <td>${item.events.toLocaleString()}</td>
         <td style="color:${item.threats>0?'#ea580c':'#16a34a'}">${item.threats}</td>
         <td style="color:${item.failedLogins>0?'#dc2626':'#334155'}">${item.failedLogins}</td>
@@ -897,13 +1157,26 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     recs.push({ priority:'INFO', action:`Schedule follow-up review within ${analysis.stats.critical > 0 ? '24 hours' : '7 days'}`, detail:'Re-analyze after any remediation steps to confirm threats are neutralized.' });
 
     const recPriorityColor = {CRITICAL:'#dc2626',HIGH:'#ea580c','MEDIUM-HIGH':'#d97706',MEDIUM:'#ca8a04',LOW:'#16a34a',INFO:'#3b82f6'};
-    const recCards = recs.map((r,i) => `<div class="rec-card">
+    const recCard = (r) => `<div class="rec-card">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
         <span style="font-size:11px;font-weight:800;padding:2px 10px;border-radius:99px;background:${recPriorityColor[r.priority]||'#64748b'};color:white">${r.priority}</span>
         <span style="font-weight:700;color:#1e3a5f;font-size:13px">${r.action}</span>
       </div>
       <p style="font-size:12px;color:#475569;line-height:1.5">${r.detail}</p>
-    </div>`).join('');
+    </div>`;
+    // Analysts think in priorities, not a flat list: bucket into Immediate /
+    // Within 24 Hours / Routine using the priority already assigned above.
+    const immediateRecs = recs.filter(r => r.priority === 'CRITICAL');
+    const next24hRecs = recs.filter(r => r.priority === 'HIGH' || r.priority === 'MEDIUM-HIGH');
+    const routineRecs = recs.filter(r => !['CRITICAL','HIGH','MEDIUM-HIGH'].includes(r.priority));
+    const recTierBlock = (label, color, list) => list.length === 0 ? '' : `
+      <div style="margin-bottom:18px">
+        <div style="font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:${color};margin-bottom:8px">${label}</div>
+        ${list.map(recCard).join('')}
+      </div>`;
+    const recCards = recTierBlock('Immediate', '#dc2626', immediateRecs)
+      + recTierBlock('Within 24 Hours', '#ea580c', next24hRecs)
+      + recTierBlock('Routine', '#16a34a', routineRecs);
 
     // ── appendix: top 50 non-low events ───────────────────────────────────
     const appendixEvents = analysis.results.filter(r=>r.threatLevel!=='low').slice(0,50);
@@ -1011,6 +1284,14 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     <span>📊 ${analysis.stats.total.toLocaleString()} total events</span>
     <span>🔍 ${analysis.stats.uniqueIPs} unique IPs</span>
   </div>
+  <div class="report-meta" style="margin-top:6px;font-size:11px;color:#94a3b8">
+    <span>Case ID: <strong style="font-family:monospace">${caseId}</strong></span>
+    <span>Detection Engine: <strong>v${DETECTION_ENGINE_VERSION}</strong></span>
+    <span>Report Template: <strong>v${REPORT_TEMPLATE_VERSION}</strong></span>
+    <span>Rules Triggered: <strong>${rulesTriggered}</strong></span>
+    <span>MITRE Coverage: <strong>${mitreObserved.size}/${TOTAL_RULE_MITRE_TECHNIQUES}</strong> techniques observed</span>
+    ${logHash ? `<span>Log SHA-256: <strong style="font-family:monospace">${logHash.slice(0,16)}…</strong></span>` : `<span>Log SHA-256: <strong>unavailable in this browser</strong></span>`}
+  </div>
 </div>
 
 <!-- 1. EXECUTIVE SUMMARY -->
@@ -1042,15 +1323,24 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     <span class="pill"><strong>${analysis.stats.total.toLocaleString()}</strong> events parsed</span>
     <span class="pill"><strong>${analysis.stats.uniqueIPs}</strong> unique source IPs</span>
     <span class="pill"><strong>${Object.keys(analysis.stats.categoryBreakdown).length}</strong> event categories</span>
-    <span class="pill"><strong>${threats.length}</strong> active threat${threats.length!==1?'s':''}</span>
-    <span class="pill"><strong>${inv.length}</strong> suspicious session${inv.length!==1?'s':''}</span>
+    <span class="pill" style="background:${threats.length>0?'#fef2f2':'#f1f5f9'};border-color:${threats.length>0?'#fca5a5':'#e2e8f0'}"><strong>${threats.length}</strong> confirmed threat${threats.length!==1?'s':''}</span>
+    <span class="pill"><strong>${inv.length}</strong> behavioral anomal${inv.length!==1?'ies':'y'} (unconfirmed)</span>
     <span class="pill"><strong>${topUsers.length}</strong> affected user${topUsers.length!==1?'s':''}</span>
   </div>
 </div>
 
-<!-- 2. KEY FINDINGS NARRATIVE -->
+<!-- 2. ANALYST CONCLUSION — the "should I panic?" answer, up front -->
 <div class="section">
-  <h2><span class="section-num">2</span>Key Findings — Why It Matters</h2>
+  <h2><span class="section-num">2</span>Analyst Conclusion</h2>
+  <div class="narrative" style="border-left:4px solid ${threats.length>0?'#dc2626':criticalSessions>0?'#ea580c':'#16a34a'};background:${threats.length>0?'#fef2f2':criticalSessions>0?'#fff7ed':'#f0fdf4'}">
+    <p style="font-weight:800;font-size:14px;margin-bottom:6px;color:#1e3a5f">${esc(verdictHeadline)}</p>
+    <p>${verdictBody}</p>
+  </div>
+</div>
+
+<!-- 3. KEY FINDINGS NARRATIVE -->
+<div class="section">
+  <h2><span class="section-num">3</span>Key Findings — Why It Matters</h2>
   <div class="narrative">${critNarrative}</div>
   <div class="narrative">${highNarrative}</div>
   ${inv.length > 0 ? `<div class="narrative">
@@ -1066,51 +1356,51 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
   </div>` : ''}
 </div>
 
-<!-- 3. ACTIVE THREATS -->
+<!-- 4. ACTIVE THREATS -->
 <div class="section page-break avoid-break">
-  <h2><span class="section-num">3</span>Active Threats (${threats.length})</h2>
+  <h2><span class="section-num">4</span>Active Threats (${threats.length})</h2>
   ${threatCards}
 </div>
 
-<!-- 4. INVESTIGATION FINDINGS -->
+<!-- 5. INVESTIGATION FINDINGS -->
 <div class="section page-break">
-  <h2><span class="section-num">4</span>Behavioral Investigation Findings (${inv.length})</h2>
+  <h2><span class="section-num">5</span>Behavioral Investigation Findings (${inv.length})</h2>
   ${invCards}
 </div>
 
-<!-- 5. AFFECTED USERS -->
+<!-- 6. AFFECTED USERS -->
 <div class="section page-break">
-  <h2><span class="section-num">5</span>Affected Users</h2>
+  <h2><span class="section-num">6</span>Affected Users</h2>
   <table>
-    <thead><tr><th>User / Account</th><th>Events</th><th>Alerts</th><th>Failed Logins</th><th>Source IPs</th></tr></thead>
+    <thead><tr><th>User / Account</th><th>Events</th><th>Alerts</th><th>Failed Logins</th><th>Risk</th><th>Last Seen</th><th>MITRE</th><th>Source IPs</th></tr></thead>
     <tbody>${userRows}</tbody>
   </table>
 </div>
 
-<!-- 6. AFFECTED IPs -->
+<!-- 7. AFFECTED IPs -->
 <div class="section">
-  <h2><span class="section-num">6</span>Top Source IPs</h2>
+  <h2><span class="section-num">7</span>Top Source IPs</h2>
   <table>
     <thead><tr><th>#</th><th>IP Address</th><th>Location</th><th>Risk</th><th>Events</th><th>Alerts</th><th>Failed Logins</th></tr></thead>
     <tbody>${ipRows || '<tr><td colspan="7" style="text-align:center;color:#94a3b8">No source IP data</td></tr>'}</tbody>
   </table>
 </div>
 
-<!-- 7. EVIDENCE TIMELINE -->
+<!-- 8. EVIDENCE TIMELINE -->
 <div class="section page-break">
-  <h2><span class="section-num">7</span>Evidence Timeline — Top ${evidenceEvents.length} Non-Low Events</h2>
+  <h2><span class="section-num">8</span>Evidence Timeline — Top ${evidenceEvents.length} Non-Low Events</h2>
   <div style="margin-top:4px">${timelineRows || '<div class="clean-card">✅ No medium/high/critical events to display.</div>'}</div>
 </div>
 
-<!-- 8. RECOMMENDATIONS -->
+<!-- 9. RECOMMENDATIONS -->
 <div class="section page-break">
-  <h2><span class="section-num">8</span>Recommendations</h2>
+  <h2><span class="section-num">9</span>Recommendations</h2>
   ${recCards}
 </div>
 
-<!-- 9. CATEGORY BREAKDOWN -->
+<!-- 10. CATEGORY BREAKDOWN -->
 <div class="section">
-  <h2><span class="section-num">9</span>Event Category Breakdown</h2>
+  <h2><span class="section-num">10</span>Event Category Breakdown</h2>
   <table>
     <thead><tr><th>Category</th><th>Distribution</th><th>% of Total</th></tr></thead>
     <tbody>${catRows}</tbody>
@@ -1152,14 +1442,22 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   };
 
+  const LARGE_FILE_WARN_BYTES = 50 * 1024 * 1024; // 50MB
+
   const handleFileUpload = async (event) => {
     const file = event.target.files[0];
     if (!file) return;
+    if (file.size > LARGE_FILE_WARN_BYTES) {
+      const proceed = window.confirm(
+        `This file is ${(file.size / (1024 * 1024)).toFixed(0)}MB. Everything runs in your browser tab, in chunks — large files will take a while and use significant memory. Continue?`
+      );
+      if (!proceed) return;
+    }
     setLoading(true);
     setUploadedFile(file);
     try {
       const text = await file.text();
-      analyzeLogFile(text, file.name);
+      await analyzeLogFile(text, file.name);
     } catch (error) {
       console.error('File analysis error:', error);
       alert(`Analysis error: ${error?.message || 'Unknown error. Check console for details.'}`);
@@ -1170,40 +1468,132 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
 
   const loadSampleFile = (type) => {
     setLoading(true);
-    setTimeout(() => {
-      try { analyzeLogFile(sampleLogs[type], `${type}_sample.log`); }
+    setTimeout(async () => {
+      try { await analyzeLogFile(sampleLogs[type], `${type}_sample.log`); }
       catch (e) { console.error('Sample load error:', e); alert(`Analysis error: ${e?.message || 'Unknown error'}`); }
       finally { setLoading(false); }
     }, 500);
   };
 
-  const analyzeLogFile = (logContent, fileName) => {
-    const lines = logContent.split('\n').filter(line => line.trim());
+  // Continuation lines (stack traces, wrapped JSON, indented detail) don't
+  // start with a recognizable timestamp/bracket — fold them into the
+  // previous entry instead of treating each wrapped line as its own event.
+  const LOG_START_RE = /^\s*(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}|[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{1,2}:\d{2}:\d{2}\b|[\[{]|\d{10,13}\b)/;
+
+  const mergeMultilineEntries = (rawLines) => {
+    const merged = [];
+    for (const line of rawLines) {
+      if (merged.length === 0 || LOG_START_RE.test(line)) {
+        merged.push(line);
+      } else {
+        merged[merged.length - 1] += ' ' + line.trim();
+      }
+    }
+    return merged;
+  };
+
+  // Minimal CSV line splitter with quote support (handles quoted fields
+  // containing commas, escaped quotes as "").
+  const splitCSVLine = (line) => {
+    const out = [];
+    let cur = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (inQuotes) {
+        if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; } }
+        else cur += c;
+      } else if (c === '"') { inQuotes = true; }
+      else if (c === ',') { out.push(cur); cur = ''; }
+      else cur += c;
+    }
+    out.push(cur);
+    return out;
+  };
+
+  const CSV_COLUMN_HINTS = ['timestamp', 'time', 'date', 'datetime', 'src_ip', 'source_ip', 'srcip', 'ip', 'user', 'username', 'account', 'action', 'event', 'severity', 'level', 'message', 'msg', 'status', 'dst_ip', 'destination_ip', 'port', 'protocol', 'url', 'path'];
+
+  // Detects a header row + consistent comma-delimited structure. Returns the
+  // lower-cased header list, or null if the file doesn't look like real CSV
+  // (avoids misinterpreting a plaintext log that just happens to have commas).
+  const detectCSVColumns = (lines) => {
+    if (lines.length < 2 || !lines[0].includes(',')) return null;
+    const headers = splitCSVLine(lines[0]).map(h => h.trim().toLowerCase());
+    const matchCount = headers.filter(h => CSV_COLUMN_HINTS.some(k => h.includes(k))).length;
+    if (matchCount < 2) return null;
+    const sampleCount = Math.min(5, lines.length - 1);
+    let consistent = 0;
+    for (let i = 1; i <= sampleCount; i++) {
+      if (splitCSVLine(lines[i]).length === headers.length) consistent++;
+    }
+    if (consistent < Math.max(1, sampleCount - 1)) return null;
+    return headers;
+  };
+
+  const extractParametersFromCSVRow = (headers, row) => {
+    const params = {};
+    headers.forEach((h, i) => {
+      const val = (row[i] || '').trim();
+      if (!val) return;
+      if (/timestamp|^time$|^date$|datetime/.test(h)) params.timestamp = params.timestamp || val;
+      else if (/src.*ip|source.*ip|^ip$|client/.test(h)) params.sourceIP = params.sourceIP || val;
+      else if (/dst.*ip|destination.*ip|^server$/.test(h)) params.destinationIP = params.destinationIP || val;
+      else if (/user|account/.test(h)) params.user = params.user || val;
+      else if (/port/.test(h)) params.port = params.port || val;
+      else if (/protocol|proto/.test(h)) params.protocol = params.protocol || val;
+      else if (/action|status|severity|level/.test(h)) params.action = params.action || val;
+      else if (/url|path|endpoint/.test(h)) params.url = params.url || val;
+    });
+    return params;
+  };
+
+  const SEVERITY_WEIGHT = { critical: 4, high: 3, medium: 2, low: 1 };
+  const ANALYSIS_CHUNK_SIZE = 1500;
+
+  // Processes the whole file in chunks, yielding to the browser between each
+  // chunk (via a 0ms setTimeout) so a large file doesn't freeze the tab.
+  // Handles CSV (column-aware) and plaintext/multi-line log formats.
+  const analyzeLogFile = async (logContent, fileName) => {
+    setAnalysisProgress(0);
+    const rawLines = logContent.split('\n').map(l => l.replace(/\r$/, '')).filter(l => l.trim());
+    const csvHeaders = detectCSVColumns(rawLines);
+    const lines = csvHeaders ? rawLines.slice(1) : mergeMultilineEntries(rawLines);
+
     const results = [];
     const categoryStats = {};
+    const categorySeverity = {};
     const timelineData = {};
     const uniqueIPs = new Set();
 
-    lines.forEach((line, index) => {
-      const categories = categorizeLogEntry(line);
-      const eventType = detectEventType(line);
-      const parameters = extractParameters(line);
-      const threatLevel = assessThreatLevel(categories, line, parameters);
-      
-      if (parameters.sourceIP) uniqueIPs.add(parameters.sourceIP);
-      if (parameters.destinationIP) uniqueIPs.add(parameters.destinationIP);
-      
-      categories.forEach(cat => { categoryStats[cat] = (categoryStats[cat] || 0) + 1; });
-      const timeKey = parameters.timestamp?.split(' ')[0] || parameters.timestamp?.split(':')[0] || 'Unknown';
-      if (!timelineData[timeKey]) timelineData[timeKey] = { count: 0, threats: 0 };
-      timelineData[timeKey].count++;
-      if (threatLevel === 'critical' || threatLevel === 'high') timelineData[timeKey].threats++;
-      
-      results.push({ lineNumber: index + 1, originalLog: line, categories, eventType, parameters, threatLevel, isAlert: threatLevel === 'critical' || threatLevel === 'high' });
-    });
+    for (let start = 0; start < lines.length; start += ANALYSIS_CHUNK_SIZE) {
+      const chunk = lines.slice(start, start + ANALYSIS_CHUNK_SIZE);
+      chunk.forEach((line, i) => {
+        const index = start + i;
+        const categories = categorizeLogEntry(line);
+        const eventType = detectEventType(line);
+        const parameters = csvHeaders
+          ? { ...extractParameters(line), ...extractParametersFromCSVRow(csvHeaders, splitCSVLine(line)) }
+          : extractParameters(line);
+        const { level: threatLevel, reason: threatReason } = assessThreatLevelDetailed(categories, line, parameters);
 
-    const ipIntel = {};
-    Array.from(uniqueIPs).forEach(ip => { ipIntel[ip] = generateIPIntelligence(ip); });
+        if (parameters.sourceIP) uniqueIPs.add(parameters.sourceIP);
+        if (parameters.destinationIP) uniqueIPs.add(parameters.destinationIP);
+
+        categories.forEach(cat => {
+          categoryStats[cat] = (categoryStats[cat] || 0) + 1;
+          categorySeverity[cat] = (categorySeverity[cat] || 0) + (SEVERITY_WEIGHT[threatLevel] || 1);
+        });
+        const timeKey = parameters.timestamp?.split(' ')[0] || parameters.timestamp?.split(':')[0] || 'Unknown';
+        if (!timelineData[timeKey]) timelineData[timeKey] = { count: 0, critical: 0, high: 0, medium: 0, low: 0 };
+        timelineData[timeKey].count++;
+        timelineData[timeKey][threatLevel]++;
+
+        results.push({ lineNumber: index + 1, originalLog: line, categories, eventType, parameters, threatLevel, threatReason, isAlert: threatLevel === 'critical' || threatLevel === 'high' });
+      });
+      setAnalysisProgress(Math.min(99, Math.round(((start + chunk.length) / lines.length) * 100)));
+      // Yield control back to the browser so large files don't lock the UI thread
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
 
     // Build per-IP profiles for enriched Source IP panel
     const ipProfiles = {};
@@ -1229,12 +1619,22 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
       medium: results.filter(r => r.threatLevel === 'medium').length,
       low: results.filter(r => r.threatLevel === 'low').length,
       categoryBreakdown: categoryStats,
+      categorySeverity,
       uniqueIPs: uniqueIPs.size,
-      fileName
+      fileName,
+      parseMode: csvHeaders ? 'csv' : 'text'
     };
 
-    const timeline = Object.entries(timelineData).map(([time, d]) => ({ time, count: d.count, threats: d.threats })).sort((a, b) => a.time.localeCompare(b.time));
-    setAnalysis({ results, stats, threats, investigation, timeline, ipIntelligence: ipIntel, ipProfiles });
+    const timeline = Object.entries(timelineData)
+      .map(([time, d]) => ({ time, count: d.count, critical: d.critical, high: d.high, medium: d.medium, low: d.low }))
+      .sort((a, b) => a.time.localeCompare(b.time));
+
+    setAnalysisProgress(100);
+    setAnalysis({ results, stats, threats, investigation, timeline, ipIntelligence: {}, ipProfiles });
+
+    // Geolocation runs in the background against a real API and streams in —
+    // it never blocks the rest of the analysis, and never fabricates data.
+    enrichIPIntelligence(Array.from(uniqueIPs));
   };
 
   const getThreatLevelColor = (level) => {
@@ -1257,6 +1657,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
   // Score → Tailwind color helpers (component-scoped so all panels can use them)
   const scoreColor = (s) => s >= 90 ? 'text-red-400' : s >= 80 ? 'text-orange-400' : s >= 65 ? 'text-yellow-400' : s >= 50 ? 'text-blue-400' : 'text-gray-400';
   const scoreBg    = (s) => s >= 90 ? 'bg-red-500' : s >= 80 ? 'bg-orange-500' : s >= 65 ? 'bg-yellow-500' : s >= 50 ? 'bg-blue-500' : 'bg-gray-500';
+  // Hex equivalents for use in the exported HTML report (inline styles, no Tailwind)
+  const scoreColorHex = (s) => s >= 90 ? '#dc2626' : s >= 80 ? '#ea580c' : s >= 65 ? '#ca8a04' : s >= 50 ? '#2563eb' : '#6b7280';
 
   const toggleBookmark = (lineNumber) => {
     const newBookmarks = new Set(bookmarkedEvents);
@@ -1293,6 +1695,64 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
         intel: analysis.ipIntelligence?.[ip],
         investigation: ipInvMap[ip] || null
       }));
+  };
+
+  // Builds a real correlation graph (user/IP ↔ source IP ↔ endpoint ↔ MITRE
+  // technique) from the actual investigation sessions — no placeholder or
+  // demo data. Capped per column so a huge log doesn't produce an unusable
+  // wall of nodes; the cap is shown to the user rather than hidden.
+  const buildCorrelationGraph = (inv) => {
+    const nodes = new Map(); // id -> { id, col, label, count }
+    const edgeSet = new Set();
+    const edges = [];
+    const bump = (id, col, label) => {
+      if (!nodes.has(id)) nodes.set(id, { id, col, label, count: 0 });
+      nodes.get(id).count++;
+    };
+    const link = (a, b) => {
+      const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+      if (edgeSet.has(key)) return;
+      edgeSet.add(key);
+      edges.push({ a, b });
+    };
+
+    inv.forEach(s => {
+      const entityId = `entity:${s.identifier}`;
+      bump(entityId, 0, s.identifier);
+      if (s.sourceIP && s.identifierType === 'user') {
+        const ipId = `ip:${s.sourceIP}`;
+        bump(ipId, 1, s.sourceIP);
+        link(entityId, ipId);
+      }
+      const epTypes = [...new Set((s.sessionEvents || []).map(e => e.eventType))].slice(0, 3);
+      epTypes.forEach(t => {
+        const epId = `ep:${t}`;
+        bump(epId, 2, t);
+        link(entityId, epId);
+      });
+      s.findings.forEach(f => {
+        if (f.mitre) {
+          const mId = `mitre:${f.mitre.id}`;
+          bump(mId, 3, f.mitre.id);
+          link(entityId, mId);
+        }
+      });
+    });
+
+    // Cap each column so the graph stays readable
+    const COL_CAP = 8;
+    const byCol = [0, 1, 2, 3].map(col =>
+      [...nodes.values()].filter(n => n.col === col).sort((a, b) => b.count - a.count)
+    );
+    const kept = new Set();
+    let hiddenCount = 0;
+    byCol.forEach(list => {
+      list.slice(0, COL_CAP).forEach(n => kept.add(n.id));
+      hiddenCount += Math.max(0, list.length - COL_CAP);
+    });
+    const finalNodes = [...nodes.values()].filter(n => kept.has(n.id));
+    const finalEdges = edges.filter(e => kept.has(e.a) && kept.has(e.b));
+    return { nodes: finalNodes, edges: finalEdges, hiddenCount };
   };
 
   const filteredResults = analysis?.results.filter(result => {
@@ -1476,7 +1936,12 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
           {loading && (
             <div className={`mt-4 text-center ${darkMode ? 'text-blue-400' : 'text-blue-600'}`}>
               <Activity className="w-6 h-6 animate-spin inline-block mr-2" />
-              Analyzing log file with advanced threat intelligence...
+              Analyzing log file{analysisProgress > 0 && analysisProgress < 100 ? ` — ${analysisProgress}%` : '…'}
+              {analysisProgress > 0 && (
+                <div className={`mt-2 h-1.5 rounded-full overflow-hidden max-w-md mx-auto ${darkMode ? 'bg-white/10' : 'bg-gray-200'}`}>
+                  <div className="h-full bg-blue-500 transition-all duration-150" style={{ width: `${analysisProgress}%` }} />
+                </div>
+              )}
             </div>
           )}
           
@@ -1625,13 +2090,14 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
             {/* Investigation Findings */}
             {analysis.investigation && analysis.investigation.length > 0 && (() => {
               const inv = analysis.investigation;
-              const critical = inv.filter(s => s.tier === 'critical');
-              const review   = inv.filter(s => s.tier === 'review');
-              const info     = inv.filter(s => s.tier === 'info');
+              const mitreFiltered = mitreFilter ? inv.filter(s => s.findings.some(f => f.mitre?.id === mitreFilter)) : inv;
+              const critical = mitreFiltered.filter(s => s.tier === 'critical');
+              const review   = mitreFiltered.filter(s => s.tier === 'review');
+              const info     = mitreFiltered.filter(s => s.tier === 'info');
 
               const SESSION_PREVIEW = 5;
-              const visibleSessions = showAllSessions ? inv : inv.slice(0, SESSION_PREVIEW);
-              const hiddenCount = inv.length - SESSION_PREVIEW;
+              const visibleSessions = showAllSessions ? mitreFiltered : mitreFiltered.slice(0, SESSION_PREVIEW);
+              const hiddenCount = mitreFiltered.length - SESSION_PREVIEW;
 
               const sevDot = { critical: 'bg-red-500', high: 'bg-orange-400', medium: 'bg-yellow-400', low: 'bg-green-400' };
 
@@ -1656,6 +2122,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                               {session.identifierType === 'user' ? '👤 User' : '🌐 IP'}
                             </span>
                             <span className={`font-mono font-bold ${darkMode ? 'text-white' : 'text-gray-900'}`}>{session.identifier}</span>
+                            <span onClick={e => e.stopPropagation()}><CopyButton value={session.identifier} darkMode={darkMode} label={session.identifierType === 'user' ? 'user' : 'IP'} /></span>
                             {topFinding?.mitre && (
                               <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-50 text-purple-600'}`}>
                                 {topFinding.mitre.id}
@@ -1669,9 +2136,19 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                               {topFinding.icon} {topFinding.type} — {topFinding.detail}
                             </div>
                           )}
+                          {/* Near-complete-incident strip: source IP, last seen, duration */}
+                          <div className={`flex items-center gap-3 mt-1 text-[11px] flex-wrap ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+                            {session.sourceIP && (
+                              <span className="font-mono flex items-center gap-1" onClick={e => e.stopPropagation()}>
+                                📍 {session.sourceIP}<CopyButton value={session.sourceIP} darkMode={darkMode} label="IP" />
+                              </span>
+                            )}
+                            {session.lastSeenRaw && <span>🕐 Last seen {session.lastSeenRaw}</span>}
+                            {session.durationSeconds != null && session.durationSeconds > 0 && <span>⏱ {formatDuration(session.durationSeconds)}</span>}
+                          </div>
                         </div>
                         <div className="flex items-center gap-2 shrink-0">
-                          <div className={`text-xl font-bold tabular-nums ${scoreColor(session.riskScore)}`}>
+                          <div className={`text-2xl font-bold tabular-nums ${scoreColor(session.riskScore)}`}>
                             {session.riskScore}<span className={`text-xs font-normal ${darkMode ? 'text-gray-600' : 'text-gray-400'}`}>/100</span>
                           </div>
                           {isExpanded ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
@@ -1680,7 +2157,7 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                     </button>
 
                     {/* Animated expand */}
-                    <div className={`transition-all duration-300 ease-in-out overflow-hidden ${isExpanded ? 'max-h-[3000px] opacity-100' : 'max-h-0 opacity-0'}`}>
+                    <div className={`transition-all duration-[250ms] ease-in-out overflow-hidden ${isExpanded ? 'max-h-[3000px] opacity-100' : 'max-h-0 opacity-0'}`}>
                       <div className="px-5 pb-5 border-t border-white/10">
 
                         {/* Case Summary */}
@@ -1781,24 +2258,40 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                                   <span className="text-lg">{finding.icon}</span>
                                   <span className={`font-bold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{finding.type}</span>
                                   {finding.mitre && (
-                                    <a href={`https://attack.mitre.org/techniques/${finding.mitre.id.replace('.', '/')}/`} target="_blank" rel="noopener noreferrer"
-                                      className="text-xs font-mono px-2 py-0.5 rounded border border-purple-500/50 text-purple-400 bg-purple-900/20 hover:bg-purple-800/30 transition-colors">
+                                    <button
+                                      onClick={() => setMitreFilter(f => f === finding.mitre.id ? null : finding.mitre.id)}
+                                      title={`Filter investigation to ${finding.mitre.id} findings`}
+                                      className={`text-xs font-mono px-2 py-0.5 rounded border transition-colors ${mitreFilter === finding.mitre.id ? 'border-purple-400 text-white bg-purple-600' : 'border-purple-500/50 text-purple-400 bg-purple-900/20 hover:bg-purple-800/30'}`}>
                                       {finding.mitre.id}
-                                    </a>
+                                    </button>
                                   )}
-                                  {finding.mitre && (
-                                    <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'text-purple-300/70 bg-purple-900/10' : 'text-purple-600 bg-purple-50'}`}>
-                                      {finding.mitre.tactic}
-                                    </span>
-                                  )}
+                                  <a href={finding.mitre ? `https://attack.mitre.org/techniques/${finding.mitre.id.replace('.', '/')}/` : undefined} target="_blank" rel="noopener noreferrer"
+                                    className={finding.mitre ? `text-xs px-2 py-0.5 rounded underline decoration-dotted ${darkMode ? 'text-purple-300/70 bg-purple-900/10 hover:text-purple-200' : 'text-purple-600 bg-purple-50 hover:text-purple-800'}` : 'hidden'}>
+                                    {finding.mitre?.tactic}
+                                  </a>
                                 </div>
-                                <span className={`text-xs font-bold px-2 py-1 rounded shrink-0 text-white ${scoreBg(finding.confidence)}`}>{finding.confidence}%</span>
+                                <span
+                                  title={`Why flagged:\n${(finding.evidence || []).join('\n')}`}
+                                  className={`text-sm font-bold px-2.5 py-1.5 rounded shrink-0 text-white cursor-help ${scoreBg(finding.confidence)}`}
+                                >{finding.confidence}%</span>
                               </div>
                               <p className={`text-sm mb-3 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>{finding.detail}</p>
                               {finding.evidence?.length > 0 && (
-                                <ul className={`text-xs mb-3 space-y-1 pl-4 list-disc ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
-                                  {finding.evidence.map((e, ei) => <li key={ei}>{e}</li>)}
-                                </ul>
+                                <div className="mb-3">
+                                  <div className={`text-xs font-semibold tracking-widest mb-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>EVIDENCE</div>
+                                  <ul className={`text-xs space-y-1 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                                    {finding.evidence.map((e, ei) => (
+                                      <li key={ei} className="flex items-start gap-1.5">
+                                        <span className="text-green-400 shrink-0">✓</span><span>{e}</span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                  {finding.scoreBreakdown && (
+                                    <div className={`text-xs mt-2 pt-2 border-t font-mono ${darkMode ? 'border-white/10 text-gray-500' : 'border-gray-200 text-gray-500'}`}>
+                                      → Confidence {finding.confidence}%: {finding.scoreBreakdown}
+                                    </div>
+                                  )}
+                                </div>
                               )}
                               {finding.sparklineData && finding.sparklineData.length > 1 && (
                                 <div className="mb-3">
@@ -1862,6 +2355,11 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                         {review.length > 0 && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-orange-500/20 text-orange-400 border border-orange-500/30">⚠️ {review.length} Review</span>}
                         {info.length > 0 && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30">ℹ️ {info.length} Info</span>}
                       </div>
+                      {mitreFilter && (
+                        <button onClick={() => setMitreFilter(null)} className="text-xs font-mono font-bold px-2 py-0.5 rounded-full bg-purple-600 text-white flex items-center gap-1">
+                          Filtering: {mitreFilter} ✕
+                        </button>
+                      )}
                     </div>
                     <button onClick={() => setShowInvestigation(!showInvestigation)} className={`p-2 rounded ${darkMode ? 'bg-white/10 hover:bg-white/20' : 'bg-purple-100 hover:bg-purple-200'} transition-all`}>
                       {showInvestigation ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
@@ -1939,16 +2437,105 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               );
             })()}
 
+            {/* Correlation Graph — built from real investigation sessions.
+                Click a node to trace what it's actually connected to: shared
+                source IPs, endpoints, and MITRE techniques across different
+                users/IPs are exactly the connections a log list hides. */}
+            {analysis.investigation && analysis.investigation.length > 0 && (() => {
+              const { nodes, edges, hiddenCount } = buildCorrelationGraph(analysis.investigation);
+              if (nodes.length === 0) return null;
+              const COL_X = [70, 260, 450, 640];
+              const COL_LABEL = ['Actor', 'Source IP', 'Endpoint', 'MITRE'];
+              const COL_COLOR = ['#3b82f6', '#f97316', '#06b6d4', '#a855f7'];
+              const byCol = [0, 1, 2, 3].map(c => nodes.filter(n => n.col === c));
+              const rowH = 42;
+              const height = Math.max(160, Math.max(...byCol.map(l => l.length)) * rowH + 40);
+              const posOf = {};
+              byCol.forEach((list, c) => list.forEach((n, i) => { posOf[n.id] = { x: COL_X[c], y: 30 + i * rowH + rowH / 2 }; }));
+
+              // BFS connected component from the selected node, across the whole graph
+              const adjacency = {};
+              edges.forEach(({ a, b }) => {
+                (adjacency[a] = adjacency[a] || []).push(b);
+                (adjacency[b] = adjacency[b] || []).push(a);
+              });
+              let connected = null;
+              if (selectedGraphNode) {
+                connected = new Set([selectedGraphNode]);
+                const queue = [selectedGraphNode];
+                while (queue.length) {
+                  const cur = queue.shift();
+                  (adjacency[cur] || []).forEach(n => { if (!connected.has(n)) { connected.add(n); queue.push(n); } });
+                }
+              }
+
+              return (
+                <div className={`${darkMode ? 'bg-cyan-900/10 border-cyan-500/30' : 'bg-cyan-50 border-cyan-200'} rounded-lg p-6 mb-6 border-2`}>
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="flex items-center gap-2">
+                      <Network className="w-5 h-5 text-cyan-400" />
+                      <h2 className={`text-xl font-bold ${darkMode ? 'text-cyan-400' : 'text-cyan-700'}`}>Correlation Graph</h2>
+                    </div>
+                    <button onClick={() => setShowCorrelationGraph(v => !v)} className={`p-2 rounded ${darkMode ? 'bg-white/10 hover:bg-white/20' : 'bg-cyan-100 hover:bg-cyan-200'} transition-all`}>
+                      {showCorrelationGraph ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
+                    </button>
+                  </div>
+                  <p className={`text-xs mb-4 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+                    Actors, IPs, endpoints, and MITRE techniques from actual investigation sessions. Click a node to trace its connections{hiddenCount > 0 ? ` — ${hiddenCount} lower-activity node${hiddenCount !== 1 ? 's' : ''} hidden to keep this readable` : ''}.
+                  </p>
+                  {showCorrelationGraph && (
+                    <div className="overflow-x-auto">
+                      <svg width="100%" height={height} viewBox={`0 0 720 ${height}`} style={{ minWidth: 600 }}>
+                        {COL_LABEL.map((label, c) => (
+                          <text key={c} x={COL_X[c]} y={16} fontSize="10" fontWeight="700" fill={darkMode ? '#64748b' : '#94a3b8'} textAnchor="middle">{label.toUpperCase()}</text>
+                        ))}
+                        {edges.map((e, i) => {
+                          const p1 = posOf[e.a], p2 = posOf[e.b];
+                          if (!p1 || !p2) return null;
+                          const dim = connected && (!connected.has(e.a) || !connected.has(e.b));
+                          return (
+                            <line key={i} x1={p1.x + 8} y1={p1.y} x2={p2.x - 8} y2={p2.y}
+                              stroke={dim ? (darkMode ? '#1e293b' : '#e2e8f0') : (darkMode ? '#475569' : '#cbd5e1')}
+                              strokeWidth={dim ? 1 : 1.5} />
+                          );
+                        })}
+                        {nodes.map(n => {
+                          const p = posOf[n.id];
+                          if (!p) return null;
+                          const isSelected = selectedGraphNode === n.id;
+                          const dim = connected && !connected.has(n.id);
+                          const color = COL_COLOR[n.col];
+                          return (
+                            <g key={n.id} onClick={() => setSelectedGraphNode(sel => sel === n.id ? null : n.id)} style={{ cursor: 'pointer' }} opacity={dim ? 0.25 : 1}>
+                              <circle cx={p.x} cy={p.y} r={isSelected ? 7 : 5} fill={color} stroke={isSelected ? (darkMode ? '#fff' : '#000') : 'none'} strokeWidth={1.5} />
+                              <text x={p.x + 12} y={p.y + 3} fontSize="10" fill={darkMode ? '#e2e8f0' : '#1e293b'} fontFamily={n.col !== 0 ? 'monospace' : undefined}>
+                                {n.label.length > 22 ? n.label.slice(0, 21) + '…' : n.label}
+                              </text>
+                            </g>
+                          );
+                        })}
+                      </svg>
+                    </div>
+                  )}
+                  {selectedGraphNode && (
+                    <button onClick={() => setSelectedGraphNode(null)} className={`mt-2 text-xs px-2 py-1 rounded ${darkMode ? 'bg-white/10 text-gray-300 hover:bg-white/20' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                      Clear selection ({connected ? connected.size - 1 : 0} connected node{connected && connected.size - 1 !== 1 ? 's' : ''})
+                    </button>
+                  )}
+                </div>
+              );
+            })()}
+
             {/* Charts & Top IPs Section */}
             {showCharts && (
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-                {/* Activity Timeline */}
+                {/* Activity Timeline — severity composition, not just volume */}
                 <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} rounded-lg p-6 border`}>
                   <h3 className={`text-lg font-semibold mb-1 flex items-center gap-2 ${darkMode ? '' : 'text-gray-900'}`}>
                     <Activity className="w-5 h-5 text-blue-400" />
                     Activity Timeline
                   </h3>
-                  <p className={`text-xs mb-4 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Events by time period — spikes indicate bursts of activity</p>
+                  <p className={`text-xs mb-4 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Severity mix per time period — a bar that's mostly red/orange is what to look at, not just a tall one</p>
                   <ResponsiveContainer width="100%" height={220}>
                     <BarChart data={analysis.timeline} margin={{ top: 4, right: 8, bottom: 20, left: 0 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke={darkMode ? '#334155' : '#e2e8f0'} />
@@ -1958,13 +2545,17 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                         contentStyle={{ backgroundColor: darkMode ? '#1e293b' : '#ffffff', border: '1px solid #3b82f6', borderRadius: '8px', fontSize: '12px' }}
                         labelStyle={{ color: darkMode ? '#e5e7eb' : '#1e293b', fontWeight: 600 }}
                       />
-                      <Bar dataKey="count" name="Total Events" fill={darkMode ? '#334155' : '#cbd5e1'} radius={[2, 2, 0, 0]} />
-                      <Bar dataKey="threats" name="Threats (Critical/High)" fill="#ef4444" radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="low" stackId="sev" name="Low" fill="#22c55e" />
+                      <Bar dataKey="medium" stackId="sev" name="Medium" fill="#eab308" />
+                      <Bar dataKey="high" stackId="sev" name="High" fill="#f97316" />
+                      <Bar dataKey="critical" stackId="sev" name="Critical" fill="#ef4444" radius={[2, 2, 0, 0]} />
                     </BarChart>
                   </ResponsiveContainer>
-                  <div className="flex gap-5 mt-2">
-                    <span className="flex items-center gap-1.5 text-xs text-gray-400"><span className="w-3 h-3 rounded-sm inline-block" style={{ background: darkMode ? '#334155' : '#cbd5e1' }} />Total events</span>
-                    <span className="flex items-center gap-1.5 text-xs text-red-400"><span className="w-3 h-3 rounded-sm inline-block bg-red-500" />Threats (Critical + High)</span>
+                  <div className="flex gap-4 mt-2 flex-wrap">
+                    <span className="flex items-center gap-1.5 text-xs text-red-400"><span className="w-3 h-3 rounded-sm inline-block bg-red-500" />Critical</span>
+                    <span className="flex items-center gap-1.5 text-xs text-orange-400"><span className="w-3 h-3 rounded-sm inline-block bg-orange-500" />High</span>
+                    <span className="flex items-center gap-1.5 text-xs text-yellow-400"><span className="w-3 h-3 rounded-sm inline-block bg-yellow-500" />Medium</span>
+                    <span className="flex items-center gap-1.5 text-xs text-green-400"><span className="w-3 h-3 rounded-sm inline-block bg-green-500" />Low</span>
                   </div>
                 </div>
 
@@ -1976,7 +2567,8 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                   </h3>
                   <div className="space-y-2">
                     {getTopIPs().map((item, i) => {
-                      const riskColor = item.intel?.risk === 'High' ? 'text-red-400' : item.intel?.risk === 'Medium' ? 'text-yellow-400' : 'text-green-400';
+                      const threatCtx = getIpThreatContext(item.ip, analysis);
+                      const riskColor = threatCtx.label === 'Critical' ? 'text-red-400' : threatCtx.label === 'Elevated' || threatCtx.label === 'Monitored' ? 'text-yellow-400' : 'text-green-400';
                       const inv = item.investigation;
                       const hasInv = !!inv;
                       const rowBg = item.critical > 0 || hasInv
@@ -1985,17 +2577,21 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                       return (
                         <div key={i} className={`${rowBg} rounded p-3 transition-all`}>
                           <div className="flex justify-between items-start mb-2">
-                            <div>
-                              <div className={`font-mono font-semibold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{item.ip}</div>
-                              {item.intel && (
-                                <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>
-                                  {item.intel.country} · {item.intel.isp}
-                                </div>
-                              )}
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <div className={`font-mono font-semibold text-sm ${darkMode ? 'text-white' : 'text-gray-900'}`}>{item.ip}</div>
+                                <CopyButton value={item.ip} darkMode={darkMode} />
+                              </div>
+                              <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+                                {item.intel?.status === 'ok' ? `${item.intel.country} · ${item.intel.isp}`
+                                  : item.intel?.status === 'rate_limited' ? 'Geolocation rate-limited — try again later'
+                                  : item.intel?.status === 'error' ? 'Location unavailable'
+                                  : 'Looking up location…'}
+                              </div>
                             </div>
                             <div className="text-right shrink-0 ml-3">
                               <div className={`text-sm font-bold text-blue-400`}>{item.count.toLocaleString()} events</div>
-                              {item.intel && <div className={`text-xs font-semibold ${riskColor}`}>{item.intel.risk} Risk</div>}
+                              <div className={`text-xs font-semibold ${riskColor}`}>{threatCtx.label}</div>
                             </div>
                           </div>
                           <div className="flex gap-2 flex-wrap">
@@ -2026,26 +2622,34 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
               </div>
             )}
 
-            {/* Category Breakdown */}
+            {/* Category Breakdown — sorted by risk, not raw volume: a small category full of critical events matters more than a huge pile of routine traffic */}
             <div className={`${darkMode ? 'bg-white/10 border-white/20' : 'bg-white border-gray-200 shadow-lg'} rounded-lg p-6 mb-6 border`}>
-              <div className="flex items-center gap-2 mb-4">
+              <div className="flex items-center gap-2 mb-1">
                 <Activity className="w-5 h-5 text-blue-400" />
                 <h3 className={`text-lg font-semibold ${darkMode ? '' : 'text-gray-900'}`}>Event Categories</h3>
               </div>
-              
+              <p className={`text-xs mb-4 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Sorted by risk-weighted severity, not raw count</p>
+
               <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
-                {Object.entries(analysis.stats.categoryBreakdown).sort(([,a], [,b]) => b - a).map(([category, count]) => {
-                  const config = eventCategories[category];
-                  return (
-                    <div key={category} className={`${darkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-gray-200'} rounded-lg p-3 border hover:bg-opacity-80 transition-all`}>
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="text-xl">{config?.icon || '📋'}</span>
-                        <span className={`text-xs font-medium truncate ${darkMode ? '' : 'text-gray-900'}`}>{category}</span>
+                {(() => {
+                  const entries = Object.entries(analysis.stats.categoryBreakdown)
+                    .sort(([catA], [catB]) => (analysis.stats.categorySeverity?.[catB] || 0) - (analysis.stats.categorySeverity?.[catA] || 0));
+                  const topCat = entries[0]?.[0];
+                  return entries.map(([category, count]) => {
+                    const config = eventCategories[category];
+                    const isTop = category === topCat && (analysis.stats.categorySeverity?.[category] || 0) > count; // only flag if it's genuinely riskier-than-flat
+                    return (
+                      <div key={category} className={`${isTop ? (darkMode ? 'bg-red-900/15 border-red-500/30' : 'bg-red-50 border-red-200') : (darkMode ? 'bg-white/5 border-white/10' : 'bg-gray-50 border-gray-200')} rounded-lg p-3 border hover:bg-opacity-80 transition-all`}>
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-xl">{config?.icon || '📋'}</span>
+                          <span className={`text-xs font-medium truncate ${darkMode ? '' : 'text-gray-900'}`}>{category}</span>
+                          {isTop && <span title="Highest risk-weighted category">🔥</span>}
+                        </div>
+                        <div className="text-2xl font-bold text-blue-400">{count}</div>
                       </div>
-                      <div className="text-2xl font-bold text-blue-400">{count}</div>
-                    </div>
-                  );
-                })}
+                    );
+                  });
+                })()}
               </div>
             </div>
 
@@ -2168,6 +2772,38 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                   
                   {expandedEvent === result.lineNumber && (
                     <div className="mt-3 space-y-3">
+                      {/* Why flagged + related investigation + prev/next nav — turns this into an investigation viewer, not just a raw log viewer */}
+                      {(() => {
+                        const relatedSession = (analysis.investigation || []).find(
+                          s => (result.parameters.user && s.identifier === result.parameters.user) || (result.parameters.sourceIP && s.identifier === result.parameters.sourceIP)
+                        );
+                        const idx = filteredResults.findIndex(r => r.lineNumber === result.lineNumber);
+                        const prevEvent = idx > 0 ? filteredResults[idx - 1] : null;
+                        const nextEvent = idx >= 0 && idx < filteredResults.length - 1 ? filteredResults[idx + 1] : null;
+                        return (
+                          <div className={`rounded-lg p-3 ${darkMode ? 'bg-white/5 border border-white/10' : 'bg-gray-50 border border-gray-200'}`}>
+                            <div className={`text-xs font-bold tracking-widest mb-1 ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>WHY FLAGGED</div>
+                            <p className={`text-sm mb-2 ${darkMode ? 'text-gray-200' : 'text-gray-800'}`}>{result.threatReason || 'No specific rule matched — default classification.'}</p>
+                            {relatedSession && (
+                              <div className={`text-xs mb-2 flex items-center gap-2 flex-wrap ${darkMode ? 'text-orange-300' : 'text-orange-700'}`}>
+                                🔗 Linked investigation: <span className="font-mono">{relatedSession.identifier}</span>
+                                <span>— {relatedSession.findings[0]?.type}</span>
+                                <span className={`font-bold tabular-nums ${scoreColor(relatedSession.riskScore)}`}>{relatedSession.riskScore}/100</span>
+                                {relatedSession.findings[0]?.mitre && (
+                                  <button onClick={() => setMitreFilter(relatedSession.findings[0].mitre.id)} className={`font-mono px-1.5 py-0.5 rounded ${darkMode ? 'bg-purple-900/30 text-purple-400 hover:bg-purple-800/40' : 'bg-purple-50 text-purple-600 hover:bg-purple-100'} transition-colors`}>
+                                    {relatedSession.findings[0].mitre.id}
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                            <div className="flex gap-2">
+                              <button disabled={!prevEvent} onClick={() => prevEvent && setExpandedEvent(prevEvent.lineNumber)} className={`text-xs px-2 py-1 rounded border transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${darkMode ? 'border-white/20 text-gray-300 hover:bg-white/10' : 'border-gray-300 text-gray-600 hover:bg-gray-100'}`}>← Prev event</button>
+                              <button disabled={!nextEvent} onClick={() => nextEvent && setExpandedEvent(nextEvent.lineNumber)} className={`text-xs px-2 py-1 rounded border transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${darkMode ? 'border-white/20 text-gray-300 hover:bg-white/10' : 'border-gray-300 text-gray-600 hover:bg-gray-100'}`}>Next event →</button>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
                       {Object.keys(result.parameters).length > 0 && (
                         <div>
                           <div className={`text-sm font-semibold ${darkMode ? 'text-gray-400' : 'text-gray-700'} mb-2`}>Extracted Parameters:</div>
@@ -2189,28 +2825,32 @@ Mar 26 10:21:35: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] [Source: 
                             IP Intelligence:
                           </div>
                           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                            {result.parameters.sourceIP && analysis.ipIntelligence[result.parameters.sourceIP] && (
-                              <div className={`${darkMode ? 'bg-blue-900/30' : 'bg-blue-50'} rounded-lg p-3`}>
-                                <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-600'} mb-1`}>Source IP: {result.parameters.sourceIP}</div>
-                                <div className="grid grid-cols-2 gap-2 text-xs">
-                                  <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>Country:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{analysis.ipIntelligence[result.parameters.sourceIP].country}</span></div>
-                                  <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>City:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{analysis.ipIntelligence[result.parameters.sourceIP].city}</span></div>
-                                  <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>ISP:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{analysis.ipIntelligence[result.parameters.sourceIP].isp}</span></div>
-                                  <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>Risk:</span> <span className={`ml-2 font-semibold ${analysis.ipIntelligence[result.parameters.sourceIP].risk === 'High' ? 'text-red-400' : analysis.ipIntelligence[result.parameters.sourceIP].risk === 'Medium' ? 'text-yellow-400' : 'text-green-400'}`}>{analysis.ipIntelligence[result.parameters.sourceIP].risk}</span></div>
+                            {['sourceIP', 'destinationIP'].map(key => {
+                              const ip = result.parameters[key];
+                              if (!ip) return null;
+                              const intel = analysis.ipIntelligence[ip];
+                              const ctx = getIpThreatContext(ip, analysis);
+                              const label = key === 'sourceIP' ? 'Source IP' : 'Destination IP';
+                              return (
+                                <div key={key} className={`${key === 'sourceIP' ? (darkMode ? 'bg-blue-900/30' : 'bg-blue-50') : (darkMode ? 'bg-purple-900/30' : 'bg-purple-50')} rounded-lg p-3`}>
+                                  <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-600'} mb-1 flex items-center gap-1.5`}>{label}: {ip} <CopyButton value={ip} darkMode={darkMode} /></div>
+                                  {intel?.status === 'ok' ? (
+                                    <div className="grid grid-cols-2 gap-2 text-xs">
+                                      <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>Country:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{intel.country}</span></div>
+                                      <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>City:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{intel.city}</span></div>
+                                      <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>ISP:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{intel.isp}</span></div>
+                                      <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>Status:</span> <span className={`font-semibold ${ctx.label === 'Critical' ? 'text-red-400' : ctx.label === 'Elevated' || ctx.label === 'Monitored' ? 'text-yellow-400' : 'text-green-400'}`}>{ctx.label}</span></div>
+                                    </div>
+                                  ) : intel?.status === 'rate_limited' ? (
+                                    <p className={`text-xs ${darkMode ? 'text-yellow-400' : 'text-yellow-600'}`}>Geolocation API rate-limited — try again shortly.</p>
+                                  ) : intel?.status === 'error' ? (
+                                    <p className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Location lookup unavailable{intel.message ? ` (${intel.message})` : ''}.</p>
+                                  ) : (
+                                    <p className={`text-xs ${darkMode ? 'text-gray-500' : 'text-gray-400'}`}>Looking up location…</p>
+                                  )}
                                 </div>
-                              </div>
-                            )}
-                            {result.parameters.destinationIP && analysis.ipIntelligence[result.parameters.destinationIP] && (
-                              <div className={`${darkMode ? 'bg-purple-900/30' : 'bg-purple-50'} rounded-lg p-3`}>
-                                <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-600'} mb-1`}>Destination IP: {result.parameters.destinationIP}</div>
-                                <div className="grid grid-cols-2 gap-2 text-xs">
-                                  <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>Country:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{analysis.ipIntelligence[result.parameters.destinationIP].country}</span></div>
-                                  <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>City:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{analysis.ipIntelligence[result.parameters.destinationIP].city}</span></div>
-                                  <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>ISP:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{analysis.ipIntelligence[result.parameters.destinationIP].isp}</span></div>
-                                  <div><span className={darkMode ? 'text-gray-400' : 'text-gray-600'}>Type:</span> <span className={darkMode ? 'text-white' : 'text-gray-900'}>{analysis.ipIntelligence[result.parameters.destinationIP].type}</span></div>
-                                </div>
-                              </div>
-                            )}
+                              );
+                            })}
                           </div>
                         </div>
                       )}

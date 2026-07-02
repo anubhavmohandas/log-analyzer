@@ -22,7 +22,8 @@
 ### 🎯 Core Capabilities
 - ✅ Smart log categorization (12+ types)
 - ✅ Real-time threat detection
-- ✅ IP geolocation intelligence
+- ✅ Real IP geolocation (ipapi.co) — no fabricated data, ever
+- ✅ IPv4 + IPv6 extraction
 - ✅ Advanced pattern matching
 - ✅ Brute force detection
 - ✅ DDoS identification
@@ -32,10 +33,10 @@
 
 ### 📊 Visualizations
 - ✅ Interactive pie charts
-- ✅ Severity distribution graphs
-- ✅ Dual-series timeline (events vs. threats)
-- ✅ Top IPs dashboard
-- ✅ Category breakdown
+- ✅ Severity-composition timeline (not just volume)
+- ✅ Correlation graph (actor ↔ IP ↔ endpoint ↔ MITRE)
+- ✅ Top IPs dashboard, sorted by real risk
+- ✅ Category breakdown, sorted by risk-weighted severity
 - ✅ Real-time statistics
 - ✅ Dark/Light mode
 
@@ -48,8 +49,9 @@
 - ✅ Multi-level filtering
 - ✅ Full-text search
 - ✅ Bookmark system
-- ✅ Parameter extraction
-- ✅ Expandable details
+- ✅ CSV-aware column parsing (auto-detected)
+- ✅ Multi-line log entry merging (stack traces, wrapped JSON)
+- ✅ Chunked processing — large files won't freeze the tab
 - ✅ Export to CSV/JSON
 
 </td>
@@ -70,20 +72,22 @@
 
 ### 🕵️ Investigation Engine
 - ✅ Session-based correlation (per user/IP)
-- ✅ Risk scoring (0–100) with tiered severity
-- ✅ MITRE ATT&CK technique mapping
+- ✅ Risk scoring (0–100) with a visible, real breakdown of what earned the score
+- ✅ MITRE ATT&CK technique mapping, click-to-filter
 - ✅ Auto-generated analyst case summaries
-- ✅ Expandable investigation timelines
-- ✅ Session cards with linked findings
+- ✅ Expandable investigation timelines with source IP / last seen / duration
+- ✅ "Why flagged?" + linked-session context on every event
+- ✅ Copy-to-clipboard IOCs (users, IPs)
 
 </td>
 <td width="50%">
 
 ### 📄 Reporting
 - ✅ One-click auto-generated HTML report
-- ✅ Executive risk narrative (Critical/High/Medium/Low)
-- ✅ MITRE ATT&CK technique references
-- ✅ Filtered event appendix (Medium+ severity)
+- ✅ Analyst Conclusion / verdict section (confirmed vs. unconfirmed, explicitly)
+- ✅ Case ID, engine version, MITRE coverage, SHA-256 log integrity hash
+- ✅ Recommendations grouped by priority (Immediate / 24h / Routine)
+- ✅ Affected-users table with risk, last seen, MITRE technique
 - ✅ Self-contained, shareable output file
 
 </td>
@@ -139,7 +143,7 @@ npm run build
 
 ### 2. View Analysis
 - Automatic threat detection
-- IP intelligence with geolocation
+- Real IP geolocation (looked up live via [ipapi.co](https://ipapi.co) — private/internal IPs resolve instantly with no network call; public IPs show "Looking up…" then real data, or an explicit "unavailable" if the lookup fails or is rate-limited)
 - Interactive charts and stats
 
 ### 3. Filter & Search
@@ -197,20 +201,28 @@ Severity: CRITICAL
 💡 Recommendation:
 Block IP immediately. Enable rate limiting. Implement 2FA.
 
-🌍 IP Intelligence:
-Country: United States  |  City: Virginia
-ISP: Amazon AWS  |  Risk: High  |  Type: Datacenter
+🌍 IP Intelligence (live lookup via ipapi.co):
+Country: United States  |  City: Ashburn  |  ISP: Amazon AWS
+
+⚠️ Status: Elevated — derived from this analysis (2 alerts, 1 investigation session),
+not from geolocation. Location and risk are always shown separately.
 ```
 
 ---
 
 ## 🕵️ Investigation & Reporting
 
-Events are correlated into sessions per user or IP and scored 0–100 based on severity, technique diversity, and behavioral patterns. High-scoring sessions are mapped to **MITRE ATT&CK** techniques (e.g. `T1078` Valid Accounts, `T1046` Network Service Discovery, `T1595` Active Scanning) with tactic labels and direct links to the ATT&CK reference.
+Events are correlated into sessions per user or IP and scored 0–100 based on severity, technique diversity, and behavioral patterns — and every score shows its real breakdown (e.g. *"62 (base) + 15 (3 extra failures) + 8 (followed by successful login) = 85"*), not just a bare number. High-scoring sessions are mapped to **MITRE ATT&CK** techniques (e.g. `T1078` Valid Accounts, `T1046` Network Service Discovery, `T1595` Active Scanning) with tactic labels, click-to-filter, and direct links to the ATT&CK reference.
 
-Each investigation session includes an auto-generated case summary and an expandable, chronological timeline of the underlying events — built for analysts who need context, not just a raw log line.
+Each investigation session includes an auto-generated case summary, source IP / last-seen / duration, and an expandable chronological timeline of the underlying events — built for analysts who need context, not just a raw log line. A **Correlation Graph** shows actors, source IPs, endpoints, and MITRE techniques as a clickable node graph, built from the same session data, so shared infrastructure between different accounts is visible instead of buried across separate rows.
 
-The **Generate Report** action produces a self-contained HTML file with an executive risk narrative, severity breakdown, MITRE ATT&CK references, and a filtered event appendix (Medium severity and above), ready to share or archive.
+The **Generate Report** action produces a self-contained HTML file with an Analyst Conclusion (explicitly stating whether there's confirmed compromise or just unconfirmed suspicious behavior), a case ID and SHA-256 hash of the analyzed log for integrity tracking, MITRE coverage, recommendations grouped by urgency, and a filtered event appendix (Medium severity and above).
+
+### Known limitations (stated plainly, not buried)
+- **Geolocation** depends on a free third-party API (ipapi.co) with a daily rate limit. Under heavy use, lookups may show "rate-limited" instead of resolving — this is intentional; the analyzer never falls back to guessed data.
+- **Multi-line log merging** and **CSV column detection** are heuristic. Unusual formats may need manual review of the parsed output.
+- Detection rules cover **7 MITRE ATT&CK techniques**; the "MITRE coverage" figure in reports is honest about this ceiling, not a claim of full ATT&CK coverage.
+- This is a client-side, rule-based analyzer — not a SIEM. Treat findings as investigative leads, not a substitute for a qualified analyst.
 
 ---
 
